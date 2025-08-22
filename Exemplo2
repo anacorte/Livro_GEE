@@ -1,0 +1,74 @@
+//Importar shape
+var roi = ee.FeatureCollection('INSERIR CAMINHO AQUI');
+//Definir coleção
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                      .select('B.*')
+                      .filterDate('2025-04-01','2025-08-01')
+                      .filterBounds(roi)
+                      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',10))
+                      .sort('CLOUDY_PIXEL_PERCENTAGE')
+                      .first()
+                      
+print('melhor imagem', s2.get('CLOUDY_PIXEL_PERCENTAGE'))
+print('ID da imagem', s2.get('system:id'))
+
+//Recortar a cena
+var s2_filter = s2.divide(10000).clip(roi);
+
+//Composição da imagem
+Map.addLayer(s2_filter, {bands:['B4','B3','B2'],min:0, max:0.4}, "S2 RGB")
+Map.addLayer(s2_filter, {bands:['B8','B4','B3'],min:0, max:0.4}, "S2 NIR (Vegetação)")
+Map.addLayer(s2_filter, {bands:['B11','B8','B4'],min:0, max:0.4}, "S2 SNR")
+Map.addLayer(s2_filter, {bands:['B11','B8','B4'],min:0, max:0.4}, "S2 Saúde da vegetação")
+
+//Indices
+var ndvi = s2_filter.normalizedDifference(['B8', 'B4']).rename('NDVI');
+var evi = s2_filter.expression(
+  '2.5 * (NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1)',
+  {NIR: s2_filter.select('B8'), RED: s2_filter.select('B4'), BLUE: s2_filter.select('B2')}
+).rename('EVI');
+var savi = s2_filter.expression(
+  '((NIR - RED) / (NIR + RED + 0.5)) * (1.5)',
+  {NIR: s2_filter.select('B8'), RED: s2_filter.select('B4')}
+).rename('SAVI');
+
+Map.addLayer(ndvi, {min:-0.2, max:1, palette: ['red', 'white', 'green']}, "NDVI")
+Map.addLayer(evi, {min:-0.2, max:1, palette: ['red', 'white', 'green']}, "EVI")
+Map.addLayer(savi, {min:-0.2, max:1, palette: ['red', 'white', 'green']}, "SAVI")
+
+//Histograma
+
+// ---------------------------
+// Histogram example
+// ---------------------------
+
+// Select a band or index to analyze
+var bandToAnalyze = ndvi.clip(roi);  // can also use s2_filter.select('B4') or evi, savi, etc.
+
+// Reduce the image to a histogram (counts of pixel values)
+var histogram = bandToAnalyze.reduceRegion({
+  reducer: ee.Reducer.histogram({
+    maxBuckets: 256   // max number of bins
+  }),
+  geometry: roi,
+  scale: 10,
+  bestEffort: true
+});
+
+// Print histogram data
+print('Histogram of NDVI:', histogram);
+
+// Optional: visualize histogram as a chart
+var chart = ui.Chart.image.histogram({
+  image: bandToAnalyze,
+  region: roi,
+  scale: 10,
+  minBucketWidth: 0.01
+}).setOptions({
+  title: 'Histogram of NDVI values',
+  hAxis: {title: 'NDVI'},
+  vAxis: {title: 'Pixel count'},
+  colors: ['green']
+});
+
+print(chart);
