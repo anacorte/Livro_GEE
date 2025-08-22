@@ -1,0 +1,290 @@
+// -----------------------------
+// Definição da região de interesse (ROI)
+// Aqui carregamos um shapefile previamente enviado ao GEE com a área de estudo.
+var roi = ee.FeatureCollection('MUDAR CAMINHO AQUI');
+
+// -----------------------------
+// DADOS OPTICOS (Landsat-9)
+// -----------------------------
+
+// Função de máscara para remover nuvens e sombras usando a banda QA_PIXEL.
+function maskL8sr(image) {
+  var cloudShadowBitMask = 1 << 3;
+  var cloudsBitMask = 1 << 4;
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+      .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask)
+    .select("SR_B[0-9]*")
+    .copyProperties(image, ["system:time_start"]);
+}
+
+// Coleção Landsat 9 Level 2, Collection 2, Tier 1.
+// Aplica filtro temporal, espacial, máscara de nuvens e filtro por porcentagem de nuvens.
+var collectionl9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+  .filterDate('2025-05-01', '2025-08-01')
+  .filterBounds(roi)
+  .map(maskL8sr)
+  .filter(ee.Filter.lte('CLOUD_COVER', 10));
+print(collectionl9, 'Landsat');
+
+// Aplicação de fatores de escala.
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  return image.addBands(opticalBands, null, true);
+}
+
+collectionl9 = collectionl9.map(applyScaleFactors);
+
+// Índices espectrais (vegetação):
+// NDVI = diferença normalizada entre NIR e RED (sensível ao vigor da vegetação).
+// EVI = melhora sensibilidade em áreas densas, corrigindo saturação e efeitos atmosféricos.
+// SAVI = similar ao NDVI, mas corrige influência do solo usando fator de ajuste (L=0.5).
+var comp = collectionl9.mean();
+var ndvi = comp.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+var evi = comp.expression(
+  '2.5 * (NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1)',
+  {NIR: comp.select('SR_B5'), RED: comp.select('SR_B4'), BLUE: comp.select('SR_B2')}
+).rename('EVI');
+var savi = comp.expression(
+  '((NIR - RED) / (NIR + RED + 0.5)) * (1.5)',
+  {NIR: comp.select('SR_B5'), RED: comp.select('SR_B4')}
+).rename('SAVI');
+
+// Composição final com bandas originais + índices.
+var composite = ee.Image.cat(comp, ndvi, evi, savi);
+Map.centerObject(roi, 14);
+composite = composite.clip(roi);
+Map.addLayer(composite, {bands: ['SR_B4', 'SR_B3', 'SR_B2'], min: 0, max: 0.4}, 'Optical');
+Map.addLayer(ndvi.clip(roi), 
+  {min: -1, max: 1, palette: ['red', 'white', 'green']}, 
+  'NDVI');
+
+// -----------------------------
+// CARREGAMENTO DE DADOS SAR (Sentinel-1)
+// -----------------------------
+
+// Coleção Sentinel-1 (polarização VV, modo IW, órbita descendente).
+// O Sentinel-1 é um radar de abertura sintética (SAR) em banda C,
+// que emite e recebe sinais em micro-ondas, podendo penetrar algumas nuvens e operando de dia/noite.
+// A polarização VV significa que o sinal foi transmitido e recebido na direção vertical.
+var collectionVV = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode', 'IW')) // modo Interferometric Wide
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .filterBounds(roi)
+  .select('VV');
+print(collectionVV, 'Collection VV'); 
+
+// Mesma lógica, mas agora com a polarização VH (transmitido vertical, recebido horizontal).
+// Comparando VV e VH conseguimos inferir estrutura e rugosidade da superfície.
+var collectionVH = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .filterBounds(roi)
+  .select('VH');
+print(collectionVH, 'Collection VH');
+
+// Selecionamos um intervalo temporal e recortamos (clip) para a área de estudo.
+// Mosaic une todas as imagens do período em um único raster.
+var SARVV = collectionVV.filterDate('2025-05-01', '2025-08-01').mosaic().clip(roi);
+var SARVH = collectionVH.filterDate('2025-05-01', '2025-08-01').mosaic().clip(roi);
+
+// -----------------------------
+// MÉTRICAS DERIVADAS DO SAR
+// -----------------------------
+
+// Radar Vegetation Index (RVI): métrica baseada em VV e VH,
+// sensível à biomassa e estrutura da vegetação.
+var RVI = SARVV.expression(
+  'sqrt( (VV) / ((VV + VH) * (VV/VH)) )',
+  {VV: SARVV, VH: SARVH}
+).rename('RVI');
+
+// Relações entre polarizações (razões VV/VH, VH/VV, diferenças):
+// usadas para inferir propriedades do alvo (água, vegetação, solo exposto).
+var COPOL = SARVV.expression('(VV/VH)', {VV: SARVV, VH: SARVH}).rename('COPOL');
+var COPOL2 = SARVV.expression('(VV - VH) - (VV + VH)', {VV: SARVV, VH: SARVH}).rename('COPOL2');
+var COPOL3 = SARVV.expression('(VH/VV)', {VV: SARVV, VH: SARVH}).rename('COPOL3');
+
+// Agrupando todas as bandas SAR (VV, VH e métricas derivadas).
+var SAR_all = ee.Image.cat(SARVV.rename('VV'), SARVH.rename('VH'), RVI, COPOL, COPOL2, COPOL3);
+
+// Visualização no mapa.
+Map.centerObject(roi, 13);
+Map.addLayer(SARVV, {min:-15,max:0}, 'SAR VV', 0);
+Map.addLayer(SARVH, {min:-25,max:0}, 'SAR VH', 0);
+Map.addLayer(RVI.clip(roi), 
+  {min: -1, max: 1, palette: ['red', 'white', 'green']}, 
+  'RVI');
+// -----------------------------
+// PRÉ-PROCESSAMENTO (Filtros)
+// -----------------------------
+
+// Filtro de média focal (suavização). Ajuda a reduzir ruído do speckle (SAR)
+// e suavizar variações locais nas imagens ópticas.
+var SMOOTHING_RADIUS = 30;
+var SARVV_filtered = SARVV.focal_mean(SMOOTHING_RADIUS, 'circle', 'meters');
+var SARVH_filtered = SARVH.focal_mean(SMOOTHING_RADIUS, 'circle', 'meters');
+var SAR_all_filtered = SAR_all.focal_mean(SMOOTHING_RADIUS, 'circle', 'meters');
+Map.addLayer(SARVV_filtered, {min:-15,max:0}, 'SAR VV FILTRADO', 0);
+Map.addLayer(SARVH_filtered, {min:-25,max:0}, 'SAR VH FILTRADO', 0);
+// Métricas de textura (GLCM) e estatísticas locais (focal).
+// Textura = variação espacial (importante para distinguir classes com mesma reflectância).
+// Estatísticas (máx, min, média, desvio) capturam heterogeneidade local.
+var optical_bands = ['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7','NDVI','EVI','SAVI'];
+var optical_texture = composite.select(optical_bands)
+  .multiply(10000).toInt32().glcmTexture({average: true});
+var optical_focal = ee.Image.cat(
+  composite.select(optical_bands).reduceNeighborhood(ee.Reducer.max(), ee.Kernel.square(1)),
+  composite.select(optical_bands).reduceNeighborhood(ee.Reducer.min(), ee.Kernel.square(1)),
+  composite.select(optical_bands).reduceNeighborhood(ee.Reducer.mean(), ee.Kernel.square(1)),
+  composite.select(optical_bands).reduceNeighborhood(ee.Reducer.stdDev(), ee.Kernel.square(1))
+);
+
+// Repetindo para SAR.
+var sar_bands = ['VV','VH','RVI','COPOL','COPOL2','COPOL3'];
+var SAR_texture = SAR_all_filtered.select(sar_bands)
+  .multiply(10000).toInt32().glcmTexture({average: true});
+var SAR_focal = ee.Image.cat(
+  SAR_all_filtered.select(sar_bands).reduceNeighborhood(ee.Reducer.max(), ee.Kernel.square(1)),
+  SAR_all_filtered.select(sar_bands).reduceNeighborhood(ee.Reducer.min(), ee.Kernel.square(1)),
+  SAR_all_filtered.select(sar_bands).reduceNeighborhood(ee.Reducer.mean(), ee.Kernel.square(1)),
+  SAR_all_filtered.select(sar_bands).reduceNeighborhood(ee.Reducer.stdDev(), ee.Kernel.square(1))
+);
+
+// -----------------------------
+// AMOSTRAS DE TREINAMENTO
+// -----------------------------
+var newfc = ee.FeatureCollection('users/fabianoengflo/amostras');
+var newImage = newfc.reduceToImage({
+  properties: ['usodosolo'],
+  reducer: ee.Reducer.first()
+});
+Map.addLayer(newImage, 
+  {min:0, max:3, palette: ['#d9ff81','#00ff7b','#ff0105','#194d15']},
+  'Amostras');
+
+// -----------------------------
+// MODELAGEM COM RF (Random Forest)
+// -----------------------------
+// Testamos 3 abordagens: somente SAR, somente óptico, e SAR+Óptico.
+// A ideia é avaliar qual conjunto de variáveis gera melhor acurácia.
+
+
+// === Apenas SAR ===
+var final_SAR = ee.Image.cat(SAR_all_filtered, SAR_texture, SAR_focal);
+var bands_SAR = final_SAR.bandNames().getInfo();
+var data_SAR = final_SAR.select(bands_SAR).sampleRegions({
+  collection: newfc,
+  properties: ['usodosolo','nomeclasse'],
+  scale: 30 
+});
+data_SAR = data_SAR.randomColumn('random', 123);
+var training_SAR = data_SAR.filter(ee.Filter.lt('random', 0.7));
+var testing_SAR  = data_SAR.filter(ee.Filter.gte('random', 0.7));
+var classifier_SAR = ee.Classifier.smileRandomForest(100).train({
+  features: training_SAR,
+  classProperty: 'usodosolo',
+  inputProperties: bands_SAR
+});
+var testClassification_SAR = testing_SAR.classify(classifier_SAR);
+var classified_SAR = final_SAR.select(bands_SAR).classify(classifier_SAR);
+Map.addLayer(classified_SAR, 
+  {min:0, max:3, palette: ['#d9ff81','#00ff7b','#ff0105','#194d15']},
+  'SAR Classification');
+
+// Matriz de confusão e acurácia
+var cm = testClassification_SAR.errorMatrix('usodosolo', 'classification');
+print('RF - SAR error matrix (numeric): ', cm);
+print('RF - SAR accuracy: ', cm.accuracy());
+
+// Exibe matriz com nomes de classes (mais intuitivo).
+var classNames = newfc.aggregate_array('nomeclasse').distinct();
+print('Class labels:', classNames);
+var cmArray = ee.Array(cm.array());
+var cmTable = ee.FeatureCollection(
+  ee.List.sequence(0, classNames.size().subtract(1)).map(function(i) {
+    i = ee.Number(i);
+    return ee.Feature(null, ee.Dictionary.fromLists(classNames, cmArray.toList().get(i)));
+  })
+);
+print('RF - SAR error matrix (labeled):', cmTable);
+
+
+// === Apenas Óptico ===
+var final_Optical = ee.Image.cat(composite, optical_texture, optical_focal);
+var bands_Optical = final_Optical.bandNames().getInfo();
+var data_Optical = final_Optical.select(bands_Optical).sampleRegions({
+  collection: newfc,
+  properties: ['usodosolo'],
+  scale: 30 
+});
+var data_Optical = data_Optical.randomColumn('random', 123);
+var training_Optical = data_Optical.filter(ee.Filter.lt('random', 0.7));
+var testing_Optical  = data_Optical.filter(ee.Filter.gte('random', 0.7));
+var classifier_Optical = ee.Classifier.smileRandomForest(100).train({
+  features: training_Optical,
+  classProperty: 'usodosolo',
+  inputProperties: bands_Optical
+});
+var testClassification_Optical = testing_Optical.classify(classifier_Optical);
+var classified_Optical = final_Optical.select(bands_Optical).classify(classifier_Optical);
+Map.addLayer(classified_Optical, 
+  {min:0, max:3, palette: ['#d9ff81','#00ff7b','#ff0105','#194d15']},
+  'Optical Classification');
+print('RF - Optical error matrix: ', testClassification_Optical.errorMatrix('usodosolo', 'classification'));
+print('RF - Optical accuracy: ', testClassification_Optical.errorMatrix('usodosolo', 'classification').accuracy());
+
+
+// === Óptico + SAR ===
+var final_OptSAR = ee.Image.cat(final_Optical, final_SAR);
+var bands_OptSAR = final_OptSAR.bandNames().getInfo();
+var data_OptSAR = final_OptSAR.select(bands_OptSAR).sampleRegions({
+  collection: newfc,
+  properties: ['usodosolo'],
+  scale: 30 
+});
+var data_OptSAR = data_OptSAR.randomColumn('random', 123);
+var training_OptSAR = data_OptSAR.filter(ee.Filter.lt('random', 0.7));
+var testing_OptSAR  = data_OptSAR.filter(ee.Filter.gte('random', 0.7));
+var classifier_OptSAR = ee.Classifier.smileRandomForest(100).train({
+  features: training_OptSAR,
+  classProperty: 'usodosolo',
+  inputProperties: bands_OptSAR
+});
+var testClassification_OptSAR = testing_OptSAR.classify(classifier_OptSAR);
+var classified_OptSAR = final_OptSAR.select(bands_OptSAR).classify(classifier_OptSAR);
+
+
+Map.addLayer(classified_OptSAR, 
+  {min:0, max:3, palette: ['#d9ff81','#00ff7b','#ff0105','#194d15']},
+  'Optical+SAR Classification');
+print('RF - OptSAR error matrix: ', testClassification_OptSAR.errorMatrix('usodosolo', 'classification'));
+print('RF - OptSAR accuracy: ', testClassification_OptSAR.errorMatrix('usodosolo', 'classification').accuracy());
+
+
+// -----------------------------
+// EXPORTAÇÃO
+// -----------------------------
+Export.image.toDrive({
+  image: classified_SAR.clip(roi),
+  description: 'SAR',
+  scale: 30,
+  fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: classified_Optical,
+  description: 'Optico',
+  scale: 30,
+  fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: classified_OptSAR,
+  description: 'classified_OptSAR',
+  scale: 30,
+  fileFormat: 'GeoTIFF'
+});
