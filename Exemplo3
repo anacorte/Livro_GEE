@@ -1,0 +1,71 @@
+// -------------------------
+// ÁREA DE ESTUDO
+// -------------------------
+var roi = ee.FeatureCollection('INSERIR CAMINHO AQUI');
+
+// -------------------------
+// FUNÇÃO DE MÁSCARA DE NUVENS - Harmonized Sentinel-2 MSI
+// -------------------------
+function maskS2clouds(image) {
+  var cloudProb = image.select('MSK_CLDPRB'); // máscara de probabilidade de nuvem
+  var scl = image.select('SCL');
+  var cloud = cloudProb.gt(10).or(scl.eq(3)).or(scl.eq(8)).or(scl.eq(9)).or(scl.eq(10)); // nuvem/sombra
+  return image.updateMask(cloud.not()).divide(10000);
+}
+
+// -------------------------
+// COLEÇÕES PARA DUAS DATAS
+// -------------------------
+var start1 = '2023-06-01';
+var end1   = '2023-08-01';
+var start2 = '2025-06-01';
+var end2   = '2025-08-01';
+
+// Coleção 2019
+var s2_2023 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filterDate(start1, end1)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',10))
+  .sort('CLOUDY_PIXEL_PERCENTAGE')
+  .map(maskS2clouds)
+  .median()
+  .clip(roi);
+
+
+// Coleção 2023
+var s2_2025 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filterDate(start2, end2)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',10))
+  .sort('CLOUDY_PIXEL_PERCENTAGE')
+  .map(maskS2clouds)
+  .median()
+  .clip(roi);
+
+// -------------------------
+// CÁLCULO DO NDVI
+// -------------------------
+function ndvi(image) {
+  return image.normalizedDifference(['B8','B4']).rename('NDVI');
+}
+
+var ndvi_2023 = ndvi(s2_2023);
+var ndvi_2025 = ndvi(s2_2025);
+
+// -------------------------
+// DETECÇÃO DE MUDANÇA (ΔNDVI)
+// -------------------------
+var deltaNDVI = ndvi_2025.subtract(ndvi_2023).rename('Delta_NDVI');
+
+// -------------------------
+// VISUALIZAÇÃO
+// -------------------------
+var ndviParams = {min: -0.9, max: 0.9, palette: ['red','yellow','green']};
+var deltaParams = {min: -0.3, max: 0.3, palette: ['red','white','green']};
+
+Map.centerObject(roi, 13);
+Map.addLayer(ndvi_2023, ndviParams, 'NDVI 2023');
+Map.addLayer(ndvi_2025, ndviParams, 'NDVI 2025');
+Map.addLayer(deltaNDVI, deltaParams, 'ΔNDVI (Mudança)');
+Map.addLayer(s2_2023, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.15}, 'RGB - 2023')
+Map.addLayer(s2_2025, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.15}, 'RGB - 2025')
