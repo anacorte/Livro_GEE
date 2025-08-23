@@ -288,3 +288,37 @@ Export.image.toDrive({
   scale: 30,
   fileFormat: 'GeoTIFF'
 });
+
+// VERIFICAÇÃO DE QUALIDADE (ACURÁCIA)
+
+// === Qualidade - Apenas SAR ===
+var testClassification_SAR = testing_SAR.classify(classifier_SAR);
+var cm_SAR = testClassification_SAR.errorMatrix('usodosolo', 'classification');
+print('Confusion Matrix - SAR:', cm_SAR);
+print('Overall Accuracy - SAR:', cm_SAR.accuracy());
+print('Producers Accuracy - SAR:', cm_SAR.producersAccuracy());
+print('Consumers Accuracy - SAR:', cm_SAR.consumersAccuracy());
+print('Kappa - SAR:', cm_SAR.kappa());
+
+// === Qualidade - Apenas Óptico ===
+var testClassification_Optical = testing_Optical.classify(classifier_Optical);
+var cm_Optical = testClassification_Optical.errorMatrix('usodosolo', 'classification');
+print('Confusion Matrix - Optical:', cm_Optical);
+print('Overall Accuracy - Optical:', cm_Optical.accuracy());
+print('Producers Accuracy - Optical:', cm_Optical.producersAccuracy());
+print('Consumers Accuracy - Optical:', cm_Optical.consumersAccuracy());
+print('Kappa - Optical:', cm_Optical.kappa());
+
+// === Qualidade - Óptico + SAR ===
+var testClassification_OptSAR = testing_OptSAR.classify(classifier_OptSAR);
+var cm_OptSAR = testClassification_OptSAR.errorMatrix('usodosolo', 'classification');
+print('Confusion Matrix - Optical+SAR:', cm_OptSAR);
+print('Overall Accuracy - Optical+SAR:', cm_OptSAR.accuracy());
+print('Producers Accuracy - Optical+SAR:', cm_OptSAR.producersAccuracy());
+print('Consumers Accuracy - Optical+SAR:', cm_OptSAR.consumersAccuracy());
+print('Kappa - Optical+SAR:', cm_OptSAR.kappa());
+
+
+
+
+
