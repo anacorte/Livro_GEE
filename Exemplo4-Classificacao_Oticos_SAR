@@ -160,7 +160,7 @@ var SAR_focal = ee.Image.cat(
 // -----------------------------
 // AMOSTRAS DE TREINAMENTO
 // -----------------------------
-var newfc = ee.FeatureCollection('users/fabianoengflo/amostras');
+var newfc = ee.FeatureCollection('users/anapaulacorte/Amostras');
 var newImage = newfc.reduceToImage({
   properties: ['usodosolo'],
   reducer: ee.Reducer.first()
@@ -367,3 +367,5 @@ var kappaUI = ui.Chart.feature.byFeature(kappaTable, 'Modelo', ['Kappa', 'OA'])
   .setChartType('Table')
   .setOptions({allowHtml: true, pageSize: 10});
 print(kappaUI);
+
+
