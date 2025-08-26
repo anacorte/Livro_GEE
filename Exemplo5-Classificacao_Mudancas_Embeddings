@@ -1,0 +1,339 @@
+// =====================================================
+// 0) ROI e parâmetros temporais
+// =====================================================
+var roi = ee.Geometry.Polygon([
+  [
+    [-50.50514984906117, -24.328943567577905],
+    [-50.42378235638539, -24.328943567577905],
+    [-50.42378235638539, -24.274811722892963],
+    [-50.50514984906117, -24.274811722892963],
+    [-50.50514984906117, -24.328943567577905]
+  ]
+]);
+var geometry = ee.FeatureCollection([ee.Feature(roi)]);
+
+Map.setOptions('SATELLITE');
+Map.centerObject(roi, 12);
+
+var year = 2024;
+var startDate = ee.Date.fromYMD(year, 1, 1);
+var endDate   = startDate.advance(1, 'year');
+
+var prevYear  = year - 1;
+var startPrev = ee.Date.fromYMD(prevYear, 1, 1);
+var endPrev   = startPrev.advance(1, 'year');
+
+// =====================================================
+// 1) Embeddings anuais (preditores da classificação)
+// =====================================================
+var embeddings = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL');
+
+var embCurrCol = embeddings.filterDate(startDate, endDate).filterBounds(roi);
+var embPrevCol = embeddings.filterDate(startPrev, endPrev).filterBounds(roi);
+
+print('Embeddings ano atual (count):', embCurrCol.size());
+print('Embeddings ano anterior (count):', embPrevCol.size());
+
+var embCurr = embCurrCol.mosaic().clip(roi);
+var embPrev = embPrevCol.mosaic().clip(roi);
+
+var predictorBands = embCurr.bandNames();
+print('Bandas embeddings (ano atual):', predictorBands);
+
+// Visual rápido dos embeddings
+Map.addLayer(embCurr, {bands:['A01','A16','A09'], min:-0.3, max:0.3}, 'Embeddings RGB (atual)');
+
+// =====================================================
+// 2) Amostras e treino (Random Forest nos embeddings)
+// =====================================================
+var classProp = 'usodosolo';
+var samplesFC = ee.FeatureCollection('users/fabianoengflo/amostras');
+
+// Rótulos nominais para suas classes (AJUSTE AQUI)
+var classLabels = ee.Dictionary({
+  0: 'Floresta',
+  1: 'Agricultura',
+  2: 'Água',
+  3: 'Urbano'
+});
+
+// Preview das amostras (opcional)
+var samplesPreview = samplesFC.reduceToImage({
+  properties: [classProp],
+  reducer: ee.Reducer.first()
+});
+Map.addLayer(samplesPreview.clip(roi),
+  {min:0, max:3, palette:['#d9ff81','#00ff7b','#ff0105','#194d15']},
+  'Amostras (usodosolo)');
+
+var trainingSamples = embCurr.sampleRegions({
+  collection: samplesFC,
+  properties: [classProp],
+  scale: 10,
+  geometries: false
+}).filter(ee.Filter.notNull(predictorBands));
+
+print('Amostras válidas (n):', trainingSamples.size());
+print('Exemplo amostra:', trainingSamples.limit(5));
+
+var withRandom = trainingSamples.randomColumn({seed: 42, columnName: 'rand'});
+var trainSet = withRandom.filter(ee.Filter.lte('rand', 0.7));
+var validSet = withRandom.filter(ee.Filter.gt('rand', 0.7));
+print('Treino (n):', trainSet.size());
+print('Validação (n):', validSet.size());
+
+var rf = ee.Classifier.smileRandomForest({numberOfTrees: 300}).train({
+  features: trainSet,
+  classProperty: classProp,
+  inputProperties: predictorBands
+});
+print('RF (embeddings):', rf);
+
+// =====================================================
+// 3) Validação hold-out
+// =====================================================
+var validated = validSet.classify(rf);
+var confMatrix = validated.errorMatrix(classProp, 'classification');
+print('Matriz de confusão:', confMatrix);
+print('Acurácia Global:', confMatrix.accuracy());
+print('Kappa:', confMatrix.kappa());
+print('Prod. Accuracy (por classe):', confMatrix.producersAccuracy());
+print('User  Accuracy (por classe):', confMatrix.consumersAccuracy());
+
+// =====================================================
+// 4) Classificação final (ano atual)
+// =====================================================
+var classified = embCurr.classify(rf).rename('class').clip(roi);
+
+// Paleta para 4 classes (ajuste conforme suas classes)
+var classPalette = ['#d9ff81', '#00ff7b', '#ff0105', '#194d15'];
+Map.addLayer(classified, {min:0, max:3, palette: classPalette}, 'Classificação RF (Embeddings)');
+
+// =====================================================
+// 5) ÁREA por classe (hectares) — CLASSIFICAÇÃO
+// =====================================================
+var areaImgHa = ee.Image.pixelArea().divide(10000);
+
+var areasDictClass = areaImgHa.addBands(classified).reduceRegion({
+  reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'classe'}),
+  geometry: roi,
+  scale: 10,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+print('Áreas por classe (ha) [raw dict]:', areasDictClass);
+
+var groupsClass = ee.List(ee.Dictionary(areasDictClass).get('groups'));
+
+var areasClassFC = ee.FeatureCollection(groupsClass.map(function(g) {
+  g = ee.Dictionary(g);
+  var cls = ee.Number(g.get('classe'));
+  var areaHa = ee.Number(g.get('sum'));
+  return ee.Feature(null, {
+    classe: cls,
+    rotulo: classLabels.get(cls.format()),   // rótulo nominal
+    area_ha: areaHa
+  });
+})).sort('classe');
+
+print('Tabela de áreas (classificação c/ rótulos):', areasClassFC);
+
+// =====================================================
+// 6) Patch Sentinel-2 para ΔNDVI (2024–2023)
+// =====================================================
+var maskS2sr = function(img) {
+  var qa = img.select('QA60');
+  var cloudBitMask  = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+               .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return img.updateMask(mask)
+            .divide(10000)
+            .copyProperties(img, ['system:time_start']);
+};
+var annualS2Composite = function(start, end) {
+  var col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterDate(start, end)
+    .filterBounds(roi)
+    .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskS2sr);
+  return col.median().clip(roi);
+};
+var s2_2023 = annualS2Composite(startPrev, endPrev);
+var s2_2024 = annualS2Composite(startDate, endDate);
+
+// =====================================================
+// 7) Mudança com sinal (ΔNDVI 2024–2023) — com máscara/clip
+// =====================================================
+var ndvi23 = s2_2023.normalizedDifference(['B8','B4']).rename('NDVI_2023');
+var ndvi24 = s2_2024.normalizedDifference(['B8','B4']).rename('NDVI_2024');
+var dNDVI  = ndvi24.subtract(ndvi23).rename('dNDVI');
+
+var TH = 0.05; // limiar de não-mudança (ajuste conforme área)
+
+// 1=diminuiu, 2=não mudou, 3=aumentou — preservando máscara do dNDVI e clipando ao ROI
+var changeSign = dNDVI.lt(-TH).multiply(1)
+  .add(dNDVI.gte(-TH).and(dNDVI.lte(TH)).multiply(2))
+  .add(dNDVI.gt(TH).multiply(3))
+  .rename('change_ΔNDVI')
+  .updateMask(dNDVI.mask())
+  .clip(roi);
+
+var changePalette = ['#d73027','#bdbdbd','#1a9850'];
+Map.addLayer(changeSign, {min:1, max:3, palette: changePalette},
+  'Mudança (ΔNDVI '+prevYear+'–'+year+'): 1=↓ 2=≈ 3=↑');
+
+// ÁREAS por classe de mudança (ha)
+var areasDictChange = areaImgHa.addBands(changeSign).reduceRegion({
+  reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'classe'}),
+  geometry: roi,
+  scale: 10,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+print('Áreas por classe de mudança (ha) [raw dict]:', areasDictChange);
+
+var labelsChange = ee.Dictionary({
+  1: 'Diminuiu (ΔNDVI < -' + TH + ')',
+  2: 'Não mudou (|ΔNDVI| ≤ ' + TH + ')',
+  3: 'Aumentou (ΔNDVI > ' + TH + ')'
+});
+
+var groupsChange = ee.List(ee.Dictionary(areasDictChange).get('groups'));
+var areasChangeFC = ee.FeatureCollection(groupsChange.map(function(g){
+  g = ee.Dictionary(g);
+  var cls = ee.Number(g.get('classe'));
+  var areaHa = ee.Number(g.get('sum'));
+  return ee.Feature(null, {
+    classe: cls,
+    rotulo: labelsChange.get(cls.format()),
+    area_ha: areaHa
+  });
+})).sort('classe');
+
+print('Tabela de áreas (mudança ΔNDVI):', areasChangeFC);
+
+// =====================================================
+// 8) (Opcional) Intensidade da mudança por cosseno (embeddings) — máscara/clip
+// =====================================================
+embPrevCol.size().evaluate(function(nPrev) {
+  if (nPrev && nPrev > 0) {
+    var commonBands = embCurr.bandNames();
+    var ePrev = embPrev.select(commonBands);
+    var eCurr = embCurr.select(commonBands);
+
+    var dot = ePrev.multiply(eCurr).reduce(ee.Reducer.sum());
+    var normPrev = ePrev.pow(2).reduce(ee.Reducer.sum()).sqrt();
+    var normCurr = eCurr.pow(2).reduce(ee.Reducer.sum()).sqrt();
+    var cosSim = dot.divide(normPrev.multiply(normCurr)).rename('cosine_similarity');
+
+    Map.addLayer(cosSim.clip(roi), {min:0.2, max:1.0}, 'Similaridade do Cosseno ('+prevYear+'→'+year+')');
+
+    var T1 = 0.70, T2 = 0.90; // limiares de intensidade
+    var changeCos = ee.Image(0)
+      .where(cosSim.lt(T1), 1)
+      .where(cosSim.gte(T1).and(cosSim.lt(T2)), 2)
+      .where(cosSim.gte(T2), 3)
+      .rename('change_cosine')
+      .updateMask(cosSim.mask())
+      .clip(roi);
+
+    Map.addLayer(changeCos, {min:1, max:3, palette:['#762a83','#af8dc3','#e7d4e8']},
+      'Intensidade de mudança (cosseno)');
+
+    var areasCos = areaImgHa.addBands(changeCos).reduceRegion({
+      reducer: ee.Reducer.sum().group({groupField:1, groupName:'classe'}),
+      geometry: roi, scale: 10, maxPixels: 1e13, tileScale: 4
+    });
+    print('Áreas (ha) por classe de intensidade (cosseno):', areasCos);
+  } else {
+    print('Sem embeddings no ano anterior (' + prevYear + ') — cosseno não calculado.');
+  }
+});
+
+// =====================================================
+// 9) TABELA SÍNTESE (Classificação + Mudança ΔNDVI)
+// =====================================================
+var areasClassWithTag  = areasClassFC.map(function(f){ return f.set('tipo','Classificacao_RF_Embeddings'); });
+var areasChangeWithTag = areasChangeFC.map(function(f){ return f.set('tipo','Mudanca_ΔNDVI'); });
+
+var tabelaSintese = areasClassWithTag.merge(areasChangeWithTag);
+print('=== TABELA SÍNTESE (áreas por classe e mudança) ===', tabelaSintese);
+
+// =====================================================
+// 10) EXPORTS
+// =====================================================
+// Classificação (raster)
+Export.image.toDrive({
+  image: classified.toInt16(),
+  description: 'classificacao_RF_embeddings_' + year,
+  folder: 'GEE',
+  fileNamePrefix: 'class_RF_embeddings_' + year,
+  region: roi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// Áreas por classe (classificação)
+Export.table.toDrive({
+  collection: areasClassFC,
+  description: 'areas_por_classe_RF_embeddings_' + year,
+  fileFormat: 'CSV'
+});
+
+// Métricas de validação
+var metricsFC = ee.FeatureCollection([
+  ee.Feature(null, {
+    overall_accuracy: confMatrix.accuracy(),
+    kappa: confMatrix.kappa(),
+    producers_accuracy: confMatrix.producersAccuracy(),
+    users_accuracy: confMatrix.consumersAccuracy()
+  })
+]);
+Export.table.toDrive({
+  collection: metricsFC,
+  description: 'metricas_validacao_RF_embeddings_' + year,
+  fileFormat: 'CSV'
+});
+
+// Mudança ΔNDVI (raster + tabela)
+Export.image.toDrive({
+  image: changeSign.toInt16(),
+  description: 'mudanca_classes_dNDVI_' + prevYear + '_para_' + year,
+  folder: 'GEE',
+  fileNamePrefix: 'mudanca_classes_dNDVI_' + prevYear + '_' + year,
+  region: roi,
+  scale: 10,
+  maxPixels: 1e13
+});
+Export.table.toDrive({
+  collection: areasChangeFC,
+  description: 'areas_mudanca_classes_dNDVI_' + prevYear + '_para_' + year,
+  fileFormat: 'CSV'
+});
+
+// Tabela síntese
+Export.table.toDrive({
+  collection: tabelaSintese,
+  description: 'tabela_sintese_classificacao_e_mudanca_' + year,
+  folder: 'GEE',
+  fileFormat: 'CSV'
+});
+
+// =====================================================
+// 11) TABELA SÍNTESE FORMATADA (UI Chart)
+// =====================================================
+var chart = ui.Chart.feature.byFeature({
+  features: tabelaSintese,
+  xProperty: 'rotulo',         // nome da classe/mudança
+  yProperties: ['area_ha']     // valor de área
+})
+.setChartType('Table')
+.setOptions({
+  allowHtml: true,
+  pageSize: 20,  // nº de linhas visíveis
+});
+
+// Mostra tabela no Console (bonitinha)
+print('=== TABELA SÍNTESE (formato tabular) ===');
+print(chart);
