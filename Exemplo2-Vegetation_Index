@@ -1,5 +1,14 @@
-//Importar shape
-var roi = ee.FeatureCollection('INSERIR CAMINHO AQUI');
+// DEFINICAO DA AREA DE INTERESSE
+var roi = ee.Geometry.Polygon([
+  [
+    [-50.50514984906117, -24.328943567577905],  // SW
+    [-50.42378235638539, -24.328943567577905],  // SE
+    [-50.42378235638539, -24.274811722892963],  // NE
+    [-50.50514984906117, -24.274811722892963],  // NW
+    [-50.50514984906117, -24.328943567577905]   // fechar polígono
+  ]
+]);
+
 //Definir coleção
 var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
                       .select('B.*')
@@ -36,16 +45,17 @@ Map.addLayer(ndvi, {min:-0.2, max:1, palette: ['red', 'white', 'green']}, "NDVI"
 Map.addLayer(evi, {min:-0.2, max:1, palette: ['red', 'white', 'green']}, "EVI")
 Map.addLayer(savi, {min:-0.2, max:1, palette: ['red', 'white', 'green']}, "SAVI")
 
+
 //Histograma
 
 // ---------------------------
-// Histogram example
+// Histograma
 // ---------------------------
 
-// Select a band or index to analyze
-var bandToAnalyze = ndvi.clip(roi);  // can also use s2_filter.select('B4') or evi, savi, etc.
+// Selecionando a banda para analisar
+var bandToAnalyze = ndvi.clip(roi);  // pode usar s2_filter.select('B4') para outros: evi, savi
 
-// Reduce the image to a histogram (counts of pixel values)
+// Contagem dos valores dos pixels
 var histogram = bandToAnalyze.reduceRegion({
   reducer: ee.Reducer.histogram({
     maxBuckets: 256   // max number of bins
@@ -55,19 +65,19 @@ var histogram = bandToAnalyze.reduceRegion({
   bestEffort: true
 });
 
-// Print histogram data
-print('Histogram of NDVI:', histogram);
+// Print histograma
+print('Histograma do NDVI:', histogram);
 
-// Optional: visualize histogram as a chart
+// Visualizar o histograma no console
 var chart = ui.Chart.image.histogram({
   image: bandToAnalyze,
   region: roi,
   scale: 10,
   minBucketWidth: 0.01
 }).setOptions({
-  title: 'Histogram of NDVI values',
+  title: 'Histograma do NDVI ',
   hAxis: {title: 'NDVI'},
-  vAxis: {title: 'Pixel count'},
+  vAxis: {title: 'Contagem dos Pixels'},
   colors: ['green']
 });
 
