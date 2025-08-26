@@ -1,0 +1,198 @@
+// =============================
+// Sentinel-1 | Mudanças Temporais 2019, 2020, 2021 (VV/VH)
+// Agosto de cada ano | Órbita descendente | IW | 10 m
+// =============================
+
+// Aoi (Área De Interesse) 
+var roi = ee.Geometry.Polygon([
+    [
+        [-56.116255, -15.469850],
+        [-55.618913, -15.469845],
+        [-55.622893, -15.0829],
+        [-56.112937, -15.088499]
+    ]
+]);
+Map.centerObject(roi, 9);
+Map.addLayer(roi, { color: 'white' }, 'Area of interest');
+
+
+
+// --- Parâmetros temporais ---
+var YEARS = [2019, 2020, 2021];
+var MONTH = 8;              // Agosto
+var SMOOTHING_RADIUS = 50;  // metros para média focal
+
+// --- Função base: carregar coleção Sentinel-1 (modo IW, 10 m, descendente) ---
+function s1Collection(polarization) {
+  return ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', polarization))
+    .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+    .filterMetadata('resolution_meters', 'equals', 10)
+    .filterBounds(roi);
+}
+
+// Coleções VV e VH
+var collectionVV = s1Collection('VV').select('VV');
+var collectionVH = s1Collection('VH').select('VH');
+
+// --- Helper: suavização (speckle) ---
+function smooth(img) {
+  return img.focal_mean(SMOOTHING_RADIUS, 'circle', 'meters');
+}
+
+// --- Helper: mediana do mês (por ano) ---
+function monthMedian_S1(col, year, month) {
+  var start = ee.Date.fromYMD(year, month, 1);
+  var end   = start.advance(1, 'month');
+  return col.filterDate(start, end).median().clip(roi);
+}
+
+// --- Imagens VH e VV por ano (agosto) ---
+var vv2019 = monthMedian_S1(collectionVV, 2019, MONTH);
+var vv2020 = monthMedian_S1(collectionVV, 2020, MONTH);
+var vv2021 = monthMedian_S1(collectionVV, 2021, MONTH);
+
+var vh2019 = monthMedian_S1(collectionVH, 2019, MONTH);
+var vh2020 = monthMedian_S1(collectionVH, 2020, MONTH);
+var vh2021 = monthMedian_S1(collectionVH, 2021, MONTH);
+
+// Composição RGB multitemporal (VH) = R:2019, G:2020, B:2021
+Map.addLayer(
+  vh2019.addBands(vh2020).addBands(vh2021),
+  {min:-25, max:-8},
+  'VH 2019/2020/2021 (RGB)', 0
+);
+
+// --- Suavização (speckle) ---
+var vv2019_f = smooth(vv2019);
+var vv2020_f = smooth(vv2020);
+var vv2021_f = smooth(vv2021);
+
+var vh2019_f = smooth(vh2019);
+var vh2020_f = smooth(vh2020);
+var vh2021_f = smooth(vh2021);
+
+// Composição RGB filtrada (VH)
+Map.addLayer(
+  vh2019_f.addBands(vh2020_f).addBands(vh2021_f),
+  {min:-25, max:-8},
+  'VH 2019/2020/2021 (filtered RGB)', 0
+);
+
+// -----------------------------------------------------
+// Diferenças (antes – depois): 2019→2020 e 2020→2021
+// -----------------------------------------------------
+var dVH_2019_2020 = vh2019_f.subtract(vh2020_f).rename('VH');
+var dVH_2020_2021 = vh2020_f.subtract(vh2021_f).rename('VH');
+
+
+// --- Estatísticas (VH) ---
+var reducers = ee.Reducer.mean().combine({
+  reducer2: ee.Reducer.stdDev(),
+  sharedInputs: true
+});
+
+var stats_19_20 = dVH_2019_2020.reduceRegion({
+  reducer: reducers, geometry: roi, scale: 10, maxPixels: 1e13
+});
+var stats_20_21 = dVH_2020_2021.reduceRegion({
+  reducer: reducers, geometry: roi, scale: 10, maxPixels: 1e13
+});
+
+print('Stats Δ VH 2019→2020', stats_19_20);
+print('Stats Δ VH 2020→2021', stats_20_21);
+
+// --- Limiar dinâmico ---
+function dynamicUpperThreshold(statsDict, band) {
+  var mean   = ee.Number(statsDict.get(band + '_mean'));
+  var stdDev = ee.Number(statsDict.get(band + '_stdDev'));
+  return mean.add(stdDev.multiply(1.5));
+}
+
+var thr_19_20 = dynamicUpperThreshold(stats_19_20, 'VH');
+var thr_20_21 = dynamicUpperThreshold(stats_20_21, 'VH');
+
+// --- Máscaras ---
+var loss_19_20 = dVH_2019_2020.gt(thr_19_20);
+var loss_20_21 = dVH_2020_2021.gt(thr_20_21);
+
+Map.addLayer(loss_19_20.updateMask(loss_19_20), {palette: ['FF0000']}, 'Perda 2019→2020 (VH)', true);
+Map.addLayer(loss_20_21.updateMask(loss_20_21), {palette: ['FF0000']}, 'Perda 2020→2021 (VH)', true);
+
+// --- Área em hectares ---
+function areaHaFromMask(maskImg) {
+  var areaImg = ee.Image.pixelArea().updateMask(maskImg);
+  var dict = areaImg.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: roi,
+    scale: 10,
+    maxPixels: 1e13
+  });
+  return ee.Number(dict.get('area')).divide(10000);
+}
+
+print('Área de perda 2019→2020 [ha]:', areaHaFromMask(loss_19_20));
+print('Área de perda 2020→2021 [ha]:', areaHaFromMask(loss_20_21));
+
+
+// =============================
+// Legenda para o mapa (perdas)
+// =============================
+function addLegendPerdas() {
+  var legend = ui.Panel({
+    style: {position: 'bottom-left', padding: '8px', backgroundColor: 'rgba(255,255,255,0.9)'}
+  });
+
+  legend.add(ui.Label('Legenda', {fontWeight: 'bold', fontSize: '12px'}));
+
+  // Função auxiliar para criar uma linha da legenda
+  function makeRow(color, name) {
+    var colorBox = ui.Label('', {
+      backgroundColor: color,
+      padding: '8px',
+      margin: '0 8px 4px 0',
+      border: '1px solid #555'
+    });
+    var desc = ui.Label(name, {fontSize: '11px'});
+    return ui.Panel([colorBox, desc], ui.Panel.Layout.Flow('horizontal'));
+  }
+
+  // As duas camadas de perda usam a mesma cor (vermelho)
+  legend.add(makeRow('#FF0000', 'Perda (ΔVH > limiar)'));
+
+  Map.add(legend);
+}
+
+// Adiciona a legenda ao mapa
+addLegendPerdas();
+
+// =============================
+// [BLOCO FINAL] União + Tabela-síntese formatada
+// =============================
+
+// União das perdas (2019→2020 ∪ 2020→2021)
+var unionLoss = loss_19_20.or(loss_20_21);
+
+// Áreas (ha)
+var area19_20 = areaHaFromMask(loss_19_20);
+var area20_21 = areaHaFromMask(loss_20_21);
+var areaTotal = areaHaFromMask(unionLoss);
+
+// Arredondar para 2 casas (só para exibir bonito no console)
+function r2(x) { return ee.Number(x).multiply(100).round().divide(100); }
+
+// Monta a tabela como FeatureCollection com colunas pedidas
+var tabela = ee.FeatureCollection([
+  ee.Feature(null, {'Intervalo': '2019→2020', 'Tipo': 'Perda', 'Área_ha': r2(area19_20)}),
+  ee.Feature(null, {'Intervalo': '2020→2021', 'Tipo': 'Perda', 'Área_ha': r2(area20_21)}),
+  ee.Feature(null, {'Intervalo': '2019→2021', 'Tipo': 'TOTAL', 'Área_ha': r2(areaTotal)})
+]);
+
+print('=== TABELA SÍNTESE DE PERDAS (ha) ===', tabela);
+
+// (Opcional) exibir como tabela “Table” no console
+var chartTabela = ui.Chart.feature.byFeature(tabela, 'Intervalo', ['Área_ha'])
+  .setChartType('Table')
+  .setOptions({title: 'Síntese de perdas (ha)'});
+print(chartTabela);
