@@ -1,0 +1,419 @@
+// Aoi (Área De Interesse) 
+var AOI = ee.Geometry.Polygon([
+    [
+        [-56.116255, -15.469850],
+        [-55.618913, -15.469845],
+        [-55.622893, -15.0829],
+        [-56.112937, -15.088499]
+    ]
+]);
+Map.centerObject(AOI, 9);
+Map.addLayer(AOI, { color: 'white' }, 'Area of interest');
+
+// Modis – Área Queimada Mensal
+
+// Carregar a coleção MODIS Monthly Burned Area
+var dataset = ee.ImageCollection('MODIS/006/MCD64A1')
+    // Filtrar pelo intervalo temporal desejado
+    .filter(ee.Filter.date('2015-01-01', '2022-12-31'));
+
+// Selecionar a banda BurnDate das imagens da coleção
+var MODIS_BurnDate = dataset.select('BurnDate');
+
+// Função para calcular a área (km²) dos pixels queimados por imagem
+var addArea = function(img) {
+    var area = ee.Image.pixelArea()
+        .updateMask(img)                 // Restringir o cálculo às áreas com dado de queima
+        .divide(1e6)                     // Converter m² para km²
+        .clip(AOI)                       // Recortar à AOI
+        .reduceRegion({
+            reducer: ee.Reducer.sum(),
+            geometry: AOI,
+            scale: 500,
+            bestEffort: true
+        })
+        .getNumber('area');              // Obter o valor de área da redução
+
+    // Adicionar uma nova banda chamada 'area' à imagem
+    return img.addBands(ee.Image(area).rename('area'));
+};
+
+// Aplicar a função na coleção de imagens
+var burnDateArea = MODIS_BurnDate.map(addArea);
+
+// Selecionar apenas a banda 'area' (datas virão do tempo do sistema)
+var burnedArea = burnDateArea.select('area');
+
+// Criar gráfico da área queimada total ao longo do tempo
+var burnedAreaChart = ui.Chart.image.series({
+        imageCollection: burnedArea,     // Coleção de imagens
+        region: AOI,
+        reducer: ee.Reducer.mean(),
+        scale: 500,
+        xProperty: 'system:time_start'   // Eixo x = tempo
+    })
+    .setSeriesNames(['Area'])            // Rótulo da legenda
+    .setOptions({
+        title: 'Total de área queimada na área de interesse',
+        hAxis: {
+            title: 'Data',
+            format: 'YYYY',
+            gridlines: { count: 12 },
+            titleTextStyle: { italic: false, bold: true }
+        },
+        vAxis: {
+            title: 'Total de área queimada (km²)',
+            maxValue: 2250,
+            minValue: 0,
+            titleTextStyle: { italic: false, bold: true }
+        },
+        lineWidth: 1.5,
+        colors: ['d74b46']
+    });
+print(burnedAreaChart);
+
+// -----------------------------------------------------------------------
+// CHECKPOINT
+// -----------------------------------------------------------------------
+
+// Carregar a coleção CHIRPS (precipitação) em pentadas.
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/PENTAD');
+
+// Definir o intervalo temporal de análise.
+var startyear = 2015;
+var endyear = 2022;
+
+// Definir datas de início e fim a partir dos anos.
+var startdate = ee.Date.fromYMD(startyear, 1, 1);
+var enddate = ee.Date.fromYMD(endyear, 12, 31);
+
+// Criar lista de anos e meses.
+var years = ee.List.sequence(startyear, endyear);
+var months = ee.List.sequence(1, 12);
+
+// Filtrar a coleção CHIRPS pelo intervalo temporal e pela AOI.
+var Pchirps = chirps
+    .filterDate(startdate, enddate)
+    .sort('system:time_start', false)    // Ordenar cronologicamente (descendente).
+    .filterBounds(AOI)                   // Filtrar pela AOI.
+    .select('precipitation');            // Selecionar a banda de precipitação.
+
+// Calcular a precipitação mensal (soma por mês).
+var MonthlyRainfall = ee.ImageCollection.fromImages(
+    years.map(function(y) {              // Iterar pelos anos do intervalo.
+        return months.map(function(m) {
+            var w = Pchirps
+                .filter(ee.Filter.calendarRange(y, y, 'year'))
+                .filter(ee.Filter.calendarRange(m, m, 'month'))
+                .sum();                  // Somar a precipitação do mês.
+
+            return w
+                .set('year', y)
+                .set('month', m)
+                .set('system:time_start', ee.Date.fromYMD(y, m, 1).millis()) // Manter tempo do sistema.
+                .set('date', ee.Date.fromYMD(y, m, 1));
+        });
+    }).flatten()
+);
+// Inspecionar a coleção de precipitação mensal.
+print('Monthly Precipitation Image Collection', MonthlyRainfall);
+
+// ** Gráfico: Precipitação (CHIRPS) ** //
+
+// Criar gráfico da precipitação mensal no intervalo definido.
+var monthlyRainfallChart = ui.Chart.image.series({
+        imageCollection: MonthlyRainfall.select('precipitation'), // Selecionar banda.
+        region: AOI,
+        reducer: ee.Reducer.mean(),       // Média espacial na AOI.
+        scale: 500,
+        xProperty: 'system:time_start'    // Eixo x = tempo.
+    })
+    .setSeriesNames(['Precipitação'])    // Rótulo da legenda.
+    .setOptions({
+        title: 'Total de precitação mensal na área de interesse',
+        hAxis: {
+            title: 'Data',
+            format: 'YYYY',
+            gridlines: { count: 12 },
+            titleTextStyle: { italic: false, bold: true }
+        },
+        vAxis: {
+            title: 'Precipitação (mm)',
+            maxValue: 450,
+            minValue: 0,
+            titleTextStyle: { italic: false, bold: true }
+        },
+        lineWidth: 1.5,
+        colors: ['4f5ebd']
+    });
+print(monthlyRainfallChart);
+
+// ** Exemplo: Totais Sazonais (Estação Chuvosa) ** //
+
+// Total 2010/2011 (ajustar ano conforme necessidade).
+var year = 2010;
+var startDate = ee.Date.fromYMD(year, 11, 1);      // Início da estação chuvosa.
+var endDate = ee.Date.fromYMD(year + 1, 5, 31);    // Fim da estação chuvosa.
+var filtered = chirps.filter(ee.Filter.date(startDate, endDate));
+var Rains10_11Total = filtered.reduce(ee.Reducer.sum()).clip(AOI);
+
+// Total 2011/2012 (ajustar ano conforme necessidade).
+var year = 2011;
+var startDate = ee.Date.fromYMD(year, 11, 1);
+var endDate = ee.Date.fromYMD(year + 1, 5, 31);
+var filtered = chirps.filter(ee.Filter.date(startDate, endDate));
+var Rains11_12Total = filtered.reduce(ee.Reducer.sum()).clip(AOI);
+
+/////////////////////
+// ** Áreas queimadas – Setembro/2019 (MODIS MCD64A1) ** //
+var modisSep2019 = dataset
+  .filterDate('2019-09-01', '2019-10-01')
+  .select('BurnDate')
+  .first();
+
+// Máscara para pixels queimados no mês (BurnDate > 0)
+var burnedSep2019 = modisSep2019.gt(0).selfMask().clip(AOI);
+
+// Adicionar camada ao mapa
+Map.addLayer(
+  burnedSep2019,
+  {min: 1, max: 1, palette: ['#ff7043']},
+  'Área queimada – Set/2019'
+);
+
+// Área queimada total (km²) em Set/2019
+var areaSep2019 = ee.Image.pixelArea()
+  .updateMask(burnedSep2019)
+  .divide(1e6)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: AOI,
+    scale: 500,
+    bestEffort: true
+  })
+  .get('area');
+
+print('Área queimada em setembro de 2019 (km²):', areaSep2019);
+
+// ** Precipitação CHIRPS – Setembro/2019 ** //
+// (usa a coleção MonthlyRainfall já criada no seu script)
+var rainSep2019 = MonthlyRainfall
+  .filter(ee.Filter.calendarRange(2019, 2019, 'year'))
+  .filter(ee.Filter.calendarRange(9, 9, 'month'))
+  .first();
+
+var meanRainSep2019 = rainSep2019.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: AOI,
+  scale: 500,
+  bestEffort: true
+}).get('precipitation');
+
+print('Precipitação média em setembro de 2019 (mm):', meanRainSep2019);
+
+
+////
+// ==============================
+// Sentinel-2 – Início de Setembro/2019 (1–10)
+// ==============================
+
+// Período-alvo (início de setembro)
+// Obs.: O segundo argumento do filterDate é exclusivo.
+// 2019-09-11 garante cobrir 01–10/09.
+var s2Start = '2019-09-01';
+var s2End   = '2019-09-11';
+
+// Função de máscara (QA60) + escala p/ reflectância + clip na AOI.
+// Retorna explicitamente ee.Image.
+var maskS2sr = function(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask  = 1 << 10;  // Nuvens
+  var cirrusBitMask = 1 << 11;  // Cirrus
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+              .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  var scaled = image.updateMask(mask).divide(10000).clip(AOI);
+  return ee.Image(scaled.copyProperties(image, ['system:time_start']));
+};
+
+// Coleção S2 SR harmonizada apenas no início de setembro
+var s2EarlySepCol = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(AOI)
+  .filterDate(s2Start, s2End)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 40)) // Ajuste se necessário
+  .map(maskS2sr);
+
+// Melhor cena (menor % nuvem) dentro do período 01–10/09
+var s2EarlySepBest = ee.Image(
+  ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(AOI)
+    .filterDate(s2Start, s2End)
+    .sort('CLOUDY_PIXEL_PERCENTAGE')
+    .first()
+);
+var s2EarlySepBestMasked = maskS2sr(s2EarlySepBest);
+
+// Composição mediana do período (mais estável contra nuvens residuais)
+var s2EarlySepMedian = s2EarlySepCol.median();
+
+// Camadas Sentinel-2 (início de setembro)
+Map.addLayer(
+  s2EarlySepBestMasked,
+  {bands: ['B4','B3','B2'], min: 0, max: 0.3},
+  'Sentinel-2 RGB (melhor cena) – Início Set/2019',
+  true, 1
+);
+Map.addLayer(
+  s2EarlySepMedian,
+  {bands: ['B8','B4','B3'], min: 0, max: 0.4},
+  'Sentinel-2 NIR (mediana) – Início Set/2019',
+  false, 1
+);
+
+// Informações e sanidade
+print('S2 Início Set/2019 – nº de imagens:', s2EarlySepCol.size());
+print('S2 Início Set/2019 – ID melhor cena:', s2EarlySepBest.get('system:id'));
+print('S2 Início Set/2019 – CLOUDY_PIXEL_PERCENTAGE:', s2EarlySepBest.get('CLOUDY_PIXEL_PERCENTAGE'));
+
+
+//////
+
+// ==============================
+// LEGENDA (Área queimada – Set/2019)
+// ==============================
+(function addLegend() {
+  var legendColor = '#ff7043';
+  var legendTitle = 'Área queimada – Set/2019';
+
+  var legendPanel = ui.Panel({
+    style: {
+      position: 'bottom-left',
+      padding: '8px',
+      backgroundColor: 'rgba(255,255,255,0.9)',
+      border: '1px solid lightgray'
+    }
+  });
+
+  legendPanel.add(ui.Label({
+    value: 'Legenda',
+    style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 6px 0'}
+  }));
+
+  var row = ui.Panel({
+    layout: ui.Panel.Layout.flow('horizontal'),
+    style: {margin: '0', padding: '0'}
+  });
+
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: legendColor,
+      padding: '10px',
+      margin: '0 8px 0 0',
+      border: '1px solid #999'
+    }
+  });
+
+  var description = ui.Label({
+    value: legendTitle,
+    style: {fontSize: '12px', margin: '4px 0 0 0'}
+  });
+
+  row.add(colorBox);
+  row.add(description);
+  legendPanel.add(row);
+  Map.add(legendPanel);
+})();
+
+// ==============================
+// TABELA-SÍNTESE (Console)
+// ==============================
+(function summaryTable() {
+  // 1) Área total da AOI (km²)
+  var aoiAreaKm2 = ee.Image.pixelArea()
+    .divide(1e6)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: AOI,
+      scale: 500,
+      bestEffort: true
+    })
+    .getNumber('area');
+
+  // 2) Certificar que temos uma coleção com a área por imagem como PROPRIEDADE
+  //    (o seu 'burnDateArea' tem a banda 'area'; aqui copiamos para propriedade 'area_km2')
+  var perImageArea = burnDateArea.map(function(img) {
+    // A banda 'area' é constante por imagem; média/qualquer redutor retorna o valor.
+    var areaVal = img.select('area')
+      .reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: AOI,
+        scale: 500,
+        bestEffort: true
+      })
+      .get('area');
+    // copiar o tempo do sistema e definir a propriedade de área
+    return img.copyProperties(img, ['system:time_start'])
+              .set('area_km2', ee.Number(areaVal));
+  });
+
+  // 3) Agregar por ano (2015–2022)
+  var yearList = ee.List.sequence(2015, 2022);
+  var yearlyFeatures = yearList.map(function(y) {
+    y = ee.Number(y);
+    var collY = perImageArea.filter(ee.Filter.calendarRange(y, y, 'year'));
+    var sumY = ee.Number(collY.aggregate_sum('area_km2'));
+    var pctY = sumY.divide(aoiAreaKm2).multiply(100);
+    return ee.Feature(null, {
+      'Período': y.format(),
+      'Área_queimada_km2': sumY,
+      'Área_total_AOI_km2': aoiAreaKm2,
+      'Percentual_%': pctY
+    });
+  });
+
+  // 4) Total do período (2015–2022)
+  var totalPeriod = ee.Number(perImageArea.aggregate_sum('area_km2'));
+  var pctPeriod = totalPeriod.divide(aoiAreaKm2).multiply(100);
+  var totalFeature = ee.Feature(null, {
+    'Período': '2015–2022 (Total)',
+    'Área_queimada_km2': totalPeriod,
+    'Área_total_AOI_km2': aoiAreaKm2,
+    'Percentual_%': pctPeriod
+  });
+
+  // 5) Linha para Setembro/2019 (mês já mapeado)
+  //    Se você já calculou 'areaSep2019' acima, reutilizamos:
+  var areaSet2019 = ee.Number(areaSep2019); // do seu cálculo anterior
+  var pctSet2019 = areaSet2019.divide(aoiAreaKm2).multiply(100);
+  var sep2019Feature = ee.Feature(null, {
+    'Período': 'Set/2019',
+    'Área_queimada_km2': areaSet2019,
+    'Área_total_AOI_km2': aoiAreaKm2,
+    'Percentual_%': pctSet2019
+  });
+
+  // 6) Montar a FeatureCollection da síntese
+  var summaryFC = ee.FeatureCollection(ee.List(yearlyFeatures)
+    .add(totalFeature)
+    .add(sep2019Feature));
+
+  // 7) Imprimir como tabela organizada
+  print('=== SÍNTESE: Áreas queimadas e total da AOI (km²) ===', summaryFC);
+
+  // (Opcional) Mostrar também um gráfico anual simples (barras)
+  var chartYearly = ui.Chart.feature.byFeature({
+      features: ee.FeatureCollection(yearlyFeatures),
+      xProperty: 'Período',
+      yProperties: ['Área_queimada_km2']
+    })
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Área queimada por ano (2015–2022) – km²',
+      legend: { position: 'none' },
+      hAxis: { title: 'Ano' },
+      vAxis: { title: 'Área queimada (km²)' }
+    });
+  print(chartYearly);
+})();
+
+
+
