@@ -1,7 +1,14 @@
 // -----------------------------
-// Definição da região de interesse (ROI)
-// Aqui carregamos um shapefile previamente enviado ao GEE com a área de estudo.
-var roi = ee.FeatureCollection('MUDAR CAMINHO AQUI');
+// DEFINICAO DA AREA DE INTERESSE
+var roi = ee.Geometry.Polygon([
+  [
+    [-50.50514984906117, -24.328943567577905],  // SW
+    [-50.42378235638539, -24.328943567577905],  // SE
+    [-50.42378235638539, -24.274811722892963],  // NE
+    [-50.50514984906117, -24.274811722892963],  // NW
+    [-50.50514984906117, -24.328943567577905]   // fechar polígono
+  ]
+]);
 
 // -----------------------------
 // DADOS OPTICOS (Landsat-9)
@@ -56,9 +63,7 @@ var composite = ee.Image.cat(comp, ndvi, evi, savi);
 Map.centerObject(roi, 14);
 composite = composite.clip(roi);
 Map.addLayer(composite, {bands: ['SR_B4', 'SR_B3', 'SR_B2'], min: 0, max: 0.4}, 'Optical');
-Map.addLayer(ndvi.clip(roi), 
-  {min: -1, max: 1, palette: ['red', 'white', 'green']}, 
-  'NDVI');
+
 
 // -----------------------------
 // CARREGAMENTO DE DADOS SAR (Sentinel-1)
@@ -115,9 +120,7 @@ var SAR_all = ee.Image.cat(SARVV.rename('VV'), SARVH.rename('VH'), RVI, COPOL, C
 Map.centerObject(roi, 13);
 Map.addLayer(SARVV, {min:-15,max:0}, 'SAR VV', 0);
 Map.addLayer(SARVH, {min:-25,max:0}, 'SAR VH', 0);
-Map.addLayer(RVI.clip(roi), 
-  {min: -1, max: 1, palette: ['red', 'white', 'green']}, 
-  'RVI');
+
 // -----------------------------
 // PRÉ-PROCESSAMENTO (Filtros)
 // -----------------------------
@@ -182,8 +185,8 @@ var data_SAR = final_SAR.select(bands_SAR).sampleRegions({
   scale: 30 
 });
 data_SAR = data_SAR.randomColumn('random', 123);
-var training_SAR = data_SAR.filter(ee.Filter.lt('random', 0.7));
-var testing_SAR  = data_SAR.filter(ee.Filter.gte('random', 0.7));
+var training_SAR = data_SAR.filter(ee.Filter.lt('random', 0.5));
+var testing_SAR  = data_SAR.filter(ee.Filter.gte('random', 0.5));
 var classifier_SAR = ee.Classifier.smileRandomForest(100).train({
   features: training_SAR,
   classProperty: 'usodosolo',
@@ -222,8 +225,8 @@ var data_Optical = final_Optical.select(bands_Optical).sampleRegions({
   scale: 30 
 });
 var data_Optical = data_Optical.randomColumn('random', 123);
-var training_Optical = data_Optical.filter(ee.Filter.lt('random', 0.7));
-var testing_Optical  = data_Optical.filter(ee.Filter.gte('random', 0.7));
+var training_Optical = data_Optical.filter(ee.Filter.lt('random', 0.5));
+var testing_Optical  = data_Optical.filter(ee.Filter.gte('random', 0.5));
 var classifier_Optical = ee.Classifier.smileRandomForest(100).train({
   features: training_Optical,
   classProperty: 'usodosolo',
@@ -247,8 +250,8 @@ var data_OptSAR = final_OptSAR.select(bands_OptSAR).sampleRegions({
   scale: 30 
 });
 var data_OptSAR = data_OptSAR.randomColumn('random', 123);
-var training_OptSAR = data_OptSAR.filter(ee.Filter.lt('random', 0.7));
-var testing_OptSAR  = data_OptSAR.filter(ee.Filter.gte('random', 0.7));
+var training_OptSAR = data_OptSAR.filter(ee.Filter.lt('random', 0.5));
+var testing_OptSAR  = data_OptSAR.filter(ee.Filter.gte('random', 0.5));
 var classifier_OptSAR = ee.Classifier.smileRandomForest(100).train({
   features: training_OptSAR,
   classProperty: 'usodosolo',
@@ -257,8 +260,12 @@ var classifier_OptSAR = ee.Classifier.smileRandomForest(100).train({
 var testClassification_OptSAR = testing_OptSAR.classify(classifier_OptSAR);
 var classified_OptSAR = final_OptSAR.select(bands_OptSAR).classify(classifier_OptSAR);
 
+// Máscaras para evitar bordas com valores nulos
+var mask_o = composite.select(0).neq(1000);
+var mask_r = SARVV_filtered.neq(1000);
+var mask = mask_r.updateMask(mask_o);
 
-Map.addLayer(classified_OptSAR, 
+Map.addLayer(classified_OptSAR.updateMask(mask), 
   {min:0, max:3, palette: ['#d9ff81','#00ff7b','#ff0105','#194d15']},
   'Optical+SAR Classification');
 print('RF - OptSAR error matrix: ', testClassification_OptSAR.errorMatrix('usodosolo', 'classification'));
@@ -269,27 +276,30 @@ print('RF - OptSAR accuracy: ', testClassification_OptSAR.errorMatrix('usodosolo
 // EXPORTAÇÃO
 // -----------------------------
 Export.image.toDrive({
-  image: classified_SAR.clip(roi),
-  description: 'SAR',
+  image: classified_SAR,
+  description: 'Optico_SAR',
   scale: 30,
   fileFormat: 'GeoTIFF'
 });
 
 Export.image.toDrive({
-  image: classified_Optical,
+  image: classifier_Optical,
   description: 'Optico',
   scale: 30,
   fileFormat: 'GeoTIFF'
 });
 
 Export.image.toDrive({
-  image: classified_OptSAR,
+  image: classifier_OptSAR,
   description: 'classified_OptSAR',
   scale: 30,
   fileFormat: 'GeoTIFF'
 });
 
+//////TESTE QUALIDADE
+// -----------------------------
 // VERIFICAÇÃO DE QUALIDADE (ACURÁCIA)
+// -----------------------------
 
 // === Qualidade - Apenas SAR ===
 var testClassification_SAR = testing_SAR.classify(classifier_SAR);
@@ -318,7 +328,42 @@ print('Producers Accuracy - Optical+SAR:', cm_OptSAR.producersAccuracy());
 print('Consumers Accuracy - Optical+SAR:', cm_OptSAR.consumersAccuracy());
 print('Kappa - Optical+SAR:', cm_OptSAR.kappa());
 
+////
 
+// ==============================
+// Tabela-resumo de Kappa no Console
+// ==============================
 
+// Função auxiliar para arredondar
+var round = function(x, d) {
+  var p = ee.Number(10).pow(d);
+  return ee.Number(x).multiply(p).round().divide(p);
+};
 
+// Monta a tabela de resultados
+var kappaTable = ee.FeatureCollection([
+  ee.Feature(null, {
+    Modelo: 'SAR',
+    Kappa: round(cm_SAR.kappa(), 3),
+    OA:    round(cm_SAR.accuracy(), 3)
+  }),
+  ee.Feature(null, {
+    Modelo: 'Óptico',
+    Kappa: round(cm_Optical.kappa(), 3),
+    OA:    round(cm_Optical.accuracy(), 3)
+  }),
+  ee.Feature(null, {
+    Modelo: 'Óptico+SAR',
+    Kappa: round(cm_OptSAR.kappa(), 3),
+    OA:    round(cm_OptSAR.accuracy(), 3)
+  })
+]).sort('Kappa', false); // ordena por Kappa desc.
 
+// Imprime como tabela (FeatureCollection) no console
+print('Resumo de Kappa e OA (FeatureCollection):', kappaTable);
+
+// (Opcional) Tabela interativa no console
+var kappaUI = ui.Chart.feature.byFeature(kappaTable, 'Modelo', ['Kappa', 'OA'])
+  .setChartType('Table')
+  .setOptions({allowHtml: true, pageSize: 10});
+print(kappaUI);
