@@ -1,0 +1,107 @@
+// DEFINICAO DA AREA DE INTERESSE
+var roi = ee.Geometry.Polygon([
+  [
+    [-50.50514984906117, -24.328943567577905],  // SW
+    [-50.42378235638539, -24.328943567577905],  // SE
+    [-50.42378235638539, -24.274811722892963],  // NE
+    [-50.50514984906117, -24.274811722892963],  // NW
+    [-50.50514984906117, -24.328943567577905]   // fechar polígono
+  ]
+]);
+
+var image = ee.ImageCollection('LANDSAT/LC08/C02/T1_TOA')
+  .filterBounds(roi)                  // ajuste para sua ROI, se quiser
+  .filterDate('2024-01-15', '2024-03-01')// janela contendo dia
+  .sort('CLOUD_COVER')                   // pega a menos nublada
+  .first();
+
+print('Imagem TOA selecionada (L8 C2):', image);
+Map.centerObject(image, 8); // ou Map.centerObject(roi, 9) se usar ROI
+
+// (Visual de referência) RGB natural da cena
+Map.addLayer(
+  image, {bands: ['B4', 'B3', 'B2'], min: 0.02, max: 0.4}, 'L8 TOA RGB', false
+);
+
+// ---------------------------------------------------------------------
+// 2) Função Tasseled Cap para Landsat 8 TOA (Baig et al., 2014)
+//    Bandas usadas: B2, B3, B4, B5, B6, B7 (coincidem com o artigo)
+// ---------------------------------------------------------------------
+function tasseledCapL8TOA(img) {
+  // Seleciona bandas espectrais OLI (coerentes com Baig et al., 2014)
+  var b = img.select(['B2','B3','B4','B5','B6','B7']);
+
+  // Coeficientes (TOA) de Baig et al. (2014)
+  var BRIGHT = ee.Image.constant([ 0.3029,  0.2786,  0.4733,  0.5599,  0.5080,  0.1872]);
+  var GREEN  = ee.Image.constant([-0.2941, -0.2430, -0.5424,  0.7276,  0.0713, -0.1608]);
+  var WET    = ee.Image.constant([ 0.1511,  0.1973,  0.3283,  0.3407, -0.7117, -0.4559]);
+  var FOURTH = ee.Image.constant([-0.8239,  0.0849,  0.4396, -0.0580,  0.2013, -0.2773]);
+  var FIFTH  = ee.Image.constant([-0.3294,  0.0557,  0.1056,  0.1855, -0.4349,  0.8085]);
+  var SIXTH  = ee.Image.constant([ 0.1079, -0.9023,  0.4119,  0.0575, -0.0259,  0.0252]);
+
+  // Produto banda-a-banda e soma (dot product) para cada componente
+  var brightness = b.multiply(BRIGHT).reduce(ee.Reducer.sum()).rename('brightness');
+  var greenness  = b.multiply(GREEN ).reduce(ee.Reducer.sum()).rename('greenness');
+  var wetness    = b.multiply(WET   ).reduce(ee.Reducer.sum()).rename('wetness');
+  var fourth     = b.multiply(FOURTH).reduce(ee.Reducer.sum()).rename('fourth');
+  var fifth      = b.multiply(FIFTH ).reduce(ee.Reducer.sum()).rename('fifth');
+  var sixth      = b.multiply(SIXTH ).reduce(ee.Reducer.sum()).rename('sixth');
+
+  // Empilhar as bandas TCT
+  return ee.Image.cat([brightness, greenness, wetness, fourth, fifth, sixth]);
+}
+
+// ---------------------------------------------------------------------
+// 3) Aplicar TCT e visualizar camadas principais (Brightness, Greenness, Wetness)
+// ---------------------------------------------------------------------
+var tct = tasseledCapL8TOA(image);
+
+// Paletas (a primeira replica a lista do notebook original)
+var paletteGeneral = [
+  'FFFFFF','C0C0C0','808080','000000','FF0000','800000',
+  'FFFF00','808000','00FF00','008000','00FFFF','008080',
+  '0000FF','000080','FF00FF','800080'
+];
+
+var paletteGreenness = [
+  'ffffe5','f7fcb9','d9f0a3','addd8e','78c679',
+  '41ab5d','238443','006837','004529'
+];
+
+// Faixas sugeridas para visualização (ajuste conforme a cena/região)
+var visBrightness = {min: -1, max: 2, palette: paletteGeneral};
+var visGreenness  = {min: -1, max: 2, palette: paletteGreenness};
+var visWetness    = {min: -1, max: 2, palette: paletteGeneral};
+
+// Adicionar camadas ao mapa
+Map.addLayer(tct.select('brightness'), visBrightness, 'TCT - Brightness');
+Map.addLayer(tct.select('greenness'),  visGreenness,  'TCT - Greenness');
+Map.addLayer(tct.select('wetness'),    visWetness,    'TCT - Wetness');
+
+// Info rápida no Console
+print('TCT (bandas):', tct.bandNames());
+
+// ---------------------------------------------------------------------
+// 4) Composição colorida: R (B4), NIR (B5) e Greenness (TCT) em RGB
+//    Canais: [R, G, B] = [B4, B5, greenness]
+// ---------------------------------------------------------------------
+
+// Renomear bandas para facilitar
+var R   = image.select('B4').rename('R');
+var NIR = image.select('B5').rename('NIR');
+var GNS = tct.select('greenness').rename('GNS');
+
+// Empilhar a imagem com 3 bandas
+var rgb_R_NIR_Greenness = ee.Image.cat([R, NIR, GNS]);
+
+// Visualização com min/max específicos por banda:
+// - R e NIR em reflectância TOA (ajuste conforme a cena)
+// - Greenness em escala típica do TCT (aprox. -1 a 2)
+var visRNG = {
+  bands: ['R','NIR','GNS'],
+  min:   [0.02, 0.02, -1],
+  max:   [0.40, 0.50,  2]
+};
+
+// Adiciona ao mapa
+Map.addLayer(rgb_R_NIR_Greenness, visRNG, 'Composição RGB: R (R), NIR (G), Greenness (B)', true);
