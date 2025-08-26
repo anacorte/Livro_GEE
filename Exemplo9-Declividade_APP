@@ -1,0 +1,166 @@
+// ================================
+// Declividade SRTM (10 m) + Classes (0–10°, 10–20°, 20–30°, 30–45°, 45–60+)
+// Áreas por classe + Hillshade + Legenda
+// ROI definida manualmente (roi)
+// ================================
+
+// ---- 0) ROI / Área de Interesse ----
+var roi = ee.Geometry.Polygon([
+  [
+    [-56.116255, -15.469850],
+    [-55.618913, -15.469845],
+    [-55.622893, -15.082900],
+    [-56.112937, -15.088499]
+  ]
+]);
+
+// ---- Parâmetros gerais ----
+var CRS = 'EPSG:4674';   // SIRGAS 2000
+var MAX_PIXELS = 1e13;
+
+// ---- 1) SRTM 30m ----
+var srtm = ee.Image('USGS/SRTMGL1_003');
+
+var srtmRawVis = {
+  min: 0,
+  max: 3000,
+  palette: ['blue', 'green', 'yellow', 'orange', 'red', 'brown', 'white']
+};
+
+// Recorte do SRTM na ROI
+var srtmRawClip = srtm.clip(roi);
+
+Map.addLayer(srtmRawClip, srtmRawVis, 'SRTM Bruto (m)', false);
+
+// ---- 2) Reamostragem p/ 10m e declividade ----
+var srtm10 = srtm.resample('bilinear').reproject({crs: CRS, scale: 10});
+var slope10 = ee.Terrain.slope(srtm10).clip(roi);
+
+// ================================
+// Declividade: classes e áreas por classe
+// ================================
+
+// Classificação: 1=0–10°, 2=10–20°, 3=20–30°, 4=30–45°, 5=45–60+
+var slopeClass = ee.Image(0)
+  .where(slope10.lt(10), 1)
+  .where(slope10.gte(10).and(slope10.lt(20)), 2)
+  .where(slope10.gte(20).and(slope10.lt(30)), 3)
+  .where(slope10.gte(30).and(slope10.lt(45)), 4)
+  .where(slope10.gte(45), 5)
+  .updateMask(slope10.mask())
+  .rename('slope_class')
+  .clip(roi);
+
+// Paleta e rótulos
+var classPalette = [
+  'ffffff', // 1: 0–10° (branco)
+  '0000ff', // 2: 10–20° (azul)
+  '00ff00', // 3: 20–30° (verde)
+  'ffff00', // 4: 30–45° (amarelo)
+  'ff0000'  // 5: 45–60+° (vermelho)
+];
+var classLabels = ['0–10°','10–20°','20–30°','30–45°','45–60+°'];
+
+// ---- 3) Visualização ----
+var hillshade = ee.Terrain.hillshade(srtm).clip(roi);
+Map.addLayer(hillshade, {min: 0, max: 255}, 'Hillshade (fundo)', true);
+Map.addLayer(
+  slopeClass,
+  {min: 1, max: 5, palette: classPalette},
+  'Declividade - Classes (10 m)',
+  true
+);
+
+// Contorno da ROI
+var outline = ee.Image().byte().paint(roi, 0, 2);
+Map.addLayer(outline, {palette: ['black']}, 'Limite da ROI', true, 1);
+Map.centerObject(roi, 10);
+
+// ---- 4) Cálculo de área (ha) por classe ----
+var areaHa = ee.Image.pixelArea().divide(10000).rename('area_ha');
+var areaByClass = areaHa.addBands(slopeClass);
+
+var grouped = areaByClass.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'classe'
+  }),
+  geometry: roi,
+  scale: slope10.projection().nominalScale(),
+  maxPixels: MAX_PIXELS
+});
+
+var groups = ee.List(grouped.get('groups'));
+var labelsDict = ee.Dictionary({
+  '1': '0–10°',
+  '2': '10–20°',
+  '3': '20–30°',
+  '4': '30–45°',
+  '5': '45–60+°'
+});
+
+var table = ee.FeatureCollection(
+  groups.map(function(item) {
+    item = ee.Dictionary(item);
+    var classe = ee.Number(item.get('classe')).int();
+    var sumHa = ee.Number(item.get('sum'));
+    var label = labelsDict.get(classe.format());
+    return ee.Feature(null, {
+      classe: classe,
+      classe_label: label,
+      area_ha: sumHa
+    });
+  })
+);
+
+print('Áreas por classe de declividade (ha):', table);
+
+// ---- 5) Legenda ----
+var legend = ui.Panel({
+  style: { position: 'bottom-left', padding: '8px 15px' }
+});
+
+legend.add(ui.Label({
+  value: 'Declividade (°) - Classes',
+  style: { fontWeight: 'bold', fontSize: '14px', margin: '0 0 6px 0' }
+}));
+
+var makeRow = function(color, name) {
+  var colorBox = ui.Label({
+    style: { backgroundColor: color, padding: '8px', margin: '0 8px 4px 0' }
+  });
+  var description = ui.Label({ value: name, style: { margin: '0 0 4px 0' } });
+  return ui.Panel({ widgets: [colorBox, description],
+                    layout: ui.Panel.Layout.Flow('horizontal') });
+};
+
+for (var i = 0; i < classPalette.length; i++) {
+  legend.add(makeRow('#' + classPalette[i], classLabels[i]));
+}
+Map.add(legend);
+
+// ================================
+// Tabela formatada no Console
+// ================================
+var chartTable = ui.Chart.feature.byFeature({
+  features: table,
+  xProperty: 'classe_label',
+  yProperties: ['area_ha']
+})
+.setChartType('Table')
+.setOptions({
+  allowHtml: true,
+  page: 'disable',
+  sortAscending: true,
+  sortColumn: 0,
+  cssClassNames: {
+    'headerRow': 'header',
+    'tableRow': 'row',
+    'oddTableRow': 'row-odd',
+    'selectedTableRow': 'row-selected',
+    'hoverTableRow': 'row-hover'
+  }
+});
+
+// Printar tabela
+print('=== Síntese das Áreas por Classe de Declividade (ha) ===', chartTable);
