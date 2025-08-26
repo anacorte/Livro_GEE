@@ -1,7 +1,13 @@
-// -------------------------
-// ÁREA DE ESTUDO
-// -------------------------
-var roi = ee.FeatureCollection('INSERIR CAMINHO AQUI');
+// DEFINICAO DA AREA DE INTERESSE
+var roi = ee.Geometry.Polygon([
+  [
+    [-50.50514984906117, -24.328943567577905],  // SW
+    [-50.42378235638539, -24.328943567577905],  // SE
+    [-50.42378235638539, -24.274811722892963],  // NE
+    [-50.50514984906117, -24.274811722892963],  // NW
+    [-50.50514984906117, -24.328943567577905]   // fechar polígono
+  ]
+]);
 
 // -------------------------
 // FUNÇÃO DE MÁSCARA DE NUVENS - Harmonized Sentinel-2 MSI
@@ -69,3 +75,137 @@ Map.addLayer(ndvi_2025, ndviParams, 'NDVI 2025');
 Map.addLayer(deltaNDVI, deltaParams, 'ΔNDVI (Mudança)');
 Map.addLayer(s2_2023, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.15}, 'RGB - 2023')
 Map.addLayer(s2_2025, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.15}, 'RGB - 2025')
+
+/////
+
+// =========================
+// 4) CLASSES DE ΔNDVI + ÁREAS
+// =========================
+
+// --- (ajuste aqui se quiser outros limites) ---
+var TH1 = -0.20;   // perda forte  (< TH1)
+var TH2 = -0.10;   // perda moderada [TH1, TH2)
+var TH3 =  0.10;   // estável       [TH2, TH3]
+var TH4 =  0.20;   // ganho moderado (TH3, TH4]
+
+// Classificação (1..5)
+var deltaClass = deltaNDVI
+  .lt(TH1).multiply(1) // 1: perda forte
+  .add(deltaNDVI.gte(TH1).and(deltaNDVI.lt(TH2)).multiply(2)) // 2: perda moderada
+  .add(deltaNDVI.gte(TH2).and(deltaNDVI.lte(TH3)).multiply(3)) // 3: estável
+  .add(deltaNDVI.gt(TH3).and(deltaNDVI.lte(TH4)).multiply(4))  // 4: ganho moderado
+  .add(deltaNDVI.gt(TH4).multiply(5))                          // 5: ganho forte
+  .rename('DeltaClass')
+  .clip(roi);
+
+// Paleta e rótulos
+var classPalette = [
+  '#b2182b', // 1: Perda forte
+  '#ef8a62', // 2: Perda moderada
+  '#ffffbf', // 3: Estável
+  '#a6d96a', // 4: Ganho moderado
+  '#1a9641'  // 5: Ganho forte
+];
+var classNames = {
+  1: 'Perda forte (< ' + TH1 + ')',
+  2: 'Perda moderada [' + TH1 + ', ' + TH2 + ')',
+  3: 'Estável [' + TH2 + ', ' + TH3 + ']',
+  4: 'Ganho moderado (' + TH3 + ', ' + TH4 + ']',
+  5: 'Ganho forte (> ' + TH4 + ')'
+};
+
+// Adiciona a camada classificada
+Map.addLayer(deltaClass, {min: 1, max: 5, palette: classPalette}, 'ΔNDVI - Classes');
+
+// --- Cálculo de áreas (hectares) por classe ---
+var pxAreaHa = ee.Image.pixelArea().divide(10000);
+var areaGrouped = pxAreaHa.addBands(deltaClass).reduceRegion({
+  reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'class'}),
+  geometry: roi,
+  scale: 10,          // Sentinel-2
+  maxPixels: 1e13
+});
+
+// Converte para tabela legível
+var groups = ee.List(areaGrouped.get('groups'));
+var table = ee.FeatureCollection(groups.map(function(g) {
+  g = ee.Dictionary(g);
+  var code = ee.Number(g.get('class'));
+  var areaHa = ee.Number(g.get('sum')); // área em ha
+  return ee.Feature(null, {
+    codigo: code,
+    classe: ee.String(ee.Dictionary(classNames).get(code.format())),
+    area_ha: areaHa,            // valor em ha
+    area_ha_arred: areaHa.round() // arredondado para facilitar leitura
+  });
+})).sort('codigo');
+
+// Mostra a tabela no console
+print('Áreas por classe (hectares):', table);
+
+// =========================
+// 5) LEGENDA NO MAPA (UI)
+// =========================
+var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px'}});
+legend.add(ui.Label({
+  value: 'ΔNDVI - Classes',
+  style: {fontWeight: 'bold', fontSize: '13px', margin: '0 0 6px 0'}
+}));
+
+// Função para uma linha de legenda
+function makeRow(color, name) {
+  var colorBox = ui.Label('', {
+    backgroundColor: color,
+    padding: '8px',
+    margin: '0 8px 4px 0'
+  });
+  var desc = ui.Label(name, {margin: '0 0 4px 0'});
+  return ui.Panel({widgets: [colorBox, desc], layout: ui.Panel.Layout.Flow('horizontal')});
+}
+
+// Adiciona entradas
+legend.add(makeRow(classPalette[0], classNames[1]));
+legend.add(makeRow(classPalette[1], classNames[2]));
+legend.add(makeRow(classPalette[2], classNames[3]));
+legend.add(makeRow(classPalette[3], classNames[4]));
+legend.add(makeRow(classPalette[4], classNames[5]));
+
+Map.add(legend);
+
+////
+// --- Cálculo de áreas (hectares) por classe ---
+var pxAreaHa = ee.Image.pixelArea().divide(10000);
+var areaGrouped = pxAreaHa.addBands(deltaClass).reduceRegion({
+  reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'class'}),
+  geometry: roi,
+  scale: 10,          // Sentinel-2
+  maxPixels: 1e13
+});
+
+// Converte para lista de dicionários
+var groups = ee.List(areaGrouped.get('groups'));
+
+// Transforma em FeatureCollection ordenada
+var table = ee.FeatureCollection(groups.map(function(g) {
+  g = ee.Dictionary(g);
+  var code = ee.Number(g.get('class'));
+  var areaHa = ee.Number(g.get('sum')); // área em ha
+  return ee.Feature(null, {
+    Classe: ee.String(ee.Dictionary(classNames).get(code.format())),
+    Area_ha: areaHa,
+    Area_ha_arred: areaHa.round()
+  });
+})).sort('Classe');
+
+// --- Printar no console como tabela ---
+print('Tabela de áreas por classe (ha):', ui.Chart.feature.byFeature({
+  features: table,
+  xProperty: 'Classe',
+  yProperties: ['Area_ha']
+}).setChartType('Table').setOptions({
+  allowHtml: true,
+  page: 'enable'
+}));
+
+// Também dá pra ver os valores individuais
+print('FeatureCollection com áreas:', table);
