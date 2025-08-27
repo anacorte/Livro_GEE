@@ -1,0 +1,48 @@
+// ==========================
+// TABELA FORMATADA (classe x areas em ha)
+// ==========================
+
+// Use uma escala razoável p/ SkySat público (~0.8 m). 2 m é mais leve e preciso o suficiente.
+var AREA_SCALE = 2;
+
+// Imagem de área (hectares)
+var areaHa = ee.Image.pixelArea().divide(10000).rename('area_ha');
+
+// Função utilitária para somar a área de uma classe
+function areaByClass(cls) {
+  var masked = areaHa.updateMask(classified.eq(cls));
+  var dict = masked.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: roi,
+    scale: AREA_SCALE,
+    maxPixels: 1e13,
+    tileScale: 4
+  });
+  // Garante 0 se a classe não ocorrer
+  return ee.Number(ee.Algorithms.If(dict.contains('area_ha'), dict.get('area_ha'), 0));
+}
+
+// 1 = Áreas arborizadas | 2 = Demais áreas
+var area1 = areaByClass(1);
+var area2 = areaByClass(2);
+
+// FeatureCollection SOMENTE com as duas colunas pedidas: classe | areas
+var tabela = ee.FeatureCollection([
+  ee.Feature(null, {'classe': 'Áreas arborizadas', 'areas': area1}),
+  ee.Feature(null, {'classe': 'Demais áreas',      'areas': area2})
+]);
+
+// Tabela "crua" (duas colunas) no console
+print('Tabela — Áreas (ha) por classe', tabela);
+
+// Tabela no formato UI Chart (tipo Table), também com duas colunas
+var tableChart = ui.Chart.feature.byFeature(tabela, 'classe', ['areas'])
+  .setChartType('Table')
+  .setOptions({
+    title: 'Áreas (ha) por classe',
+    page: 'enable',
+    pageSize: 2,
+    sort: 'disable',
+    allowHtml: true
+  });
+print(tableChart);
