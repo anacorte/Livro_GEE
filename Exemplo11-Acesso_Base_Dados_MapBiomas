@@ -1,0 +1,325 @@
+// -------------------------------------------------------
+// 1. Preparar Raster
+// -------------------------------------------------------
+// Coleção de uso e cobertura do solo - MapBiomas C10
+// Outras coleções: https://brasil.mapbiomas.org/codigos-e-ferramentas/
+var lclu = ee.Image('projects/mapbiomas-public/assets/brazil/lulc/collection10/mapbiomas_brazil_collection10_coverage_v2');
+print('Bandas disponíveis:', lclu.bandNames());
+
+// Seleciona a banda de 2023
+var lclu2023 = lclu.select('classification_2023');
+
+// -------------------------------------------------------
+// 2. Importar limites municipais do IBGE (nível 3)
+//    e filtrar por uma lista de municípios ou por área de interesse (AOI)
+// -------------------------------------------------------
+
+var municipios = ee.FeatureCollection(
+  'projects/mapbiomas-territories/assets/TERRITORIES/LULC/BRAZIL/COLLECTION9/WORKSPACE/POLITICAL_LEVEL_3'
+);
+
+// Lista de nomes de municípios — pode ficar vazia caso use interseção com AOI
+var nomesMunicipios = ['Altamira', 'Apuí', 'Placas', 'Itaituba']; // adicione mais se quiser
+
+// Geometria AOI — desenhe no mapa
+
+// Filtrar/selecionar municípios
+var municipiosSelecionados;
+if (typeof aoi !== 'undefined' && aoi !== null) {
+  municipiosSelecionados = municipios.filterBounds(aoi)
+} else {var municipiosSelecionados = municipios.filter(
+  ee.Filter.inList('NM_MUN', nomesMunicipios)
+)}
+
+// Geometria combinada de todos os municípios filtrados
+var geom = municipiosSelecionados.geometry();
+
+// Clip do raster para a área selecionada
+var clipped = lclu2023.clip(geom);
+
+// -------------------------------------------------------
+// 3. Calcula área por classe (km²) na área combinada
+// -------------------------------------------------------
+
+var pixelArea = ee.Image.pixelArea().divide(1e6); // km²
+var reducer = ee.Reducer.sum().group({
+  groupField: 1,
+  groupName: 'class'
+});
+
+var grouped = pixelArea.addBands(clipped)
+  .reduceRegion({
+    reducer: reducer,
+    geometry: geom,
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+var groups = ee.List(grouped.get('groups'));
+
+var areas = ee.FeatureCollection(
+  groups.map(function(item) {
+    var dict = ee.Dictionary(item);
+    return ee.Feature(null, {
+      class: dict.get('class'),
+      area_km2: dict.get('sum')
+    });
+  })
+);
+
+print('Estatísticas de uso do solo – Municípios selecionados (2023)', areas);
+
+// -------------------------------------------------------
+// 4. Mapa com paleta oficial MapBiomas
+// -------------------------------------------------------
+
+var palettes = require('users/mapbiomas/modules:Palettes.js');
+var pal = palettes.get('classification9');
+
+Map.centerObject(municipiosSelecionados, 7);
+Map.addLayer(
+  clipped,
+  { min: 0, max: pal.length - 1, palette: pal },
+  'LCLU 2023 – Municípios selecionados'
+);
+
+// -------------------------------------------------------
+// 5. Exportar para o Drive
+// -------------------------------------------------------
+
+// Tabela
+Export.table.toDrive({
+  collection: areas,
+  description: 'mapbiomas_selecao_2023',
+  fileFormat: 'CSV'
+});
+
+// Raster
+Export.image.toDrive({
+  image: clipped,
+  description: 'mapbiomas_raster_selecao_2023',
+  scale: 30,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF',
+  formatOptions: {cloudOptimized: true}
+});
+
+// -------------------------------------------------------
+// LEGENDA (autossuficiente): define a função e adiciona a legenda
+// -------------------------------------------------------
+
+// 1) Função para criar a legenda
+function addLegend(palette, names, codes, position) {
+  var legend = ui.Panel({
+    style: {
+      position: position || 'bottom-left',
+      padding: '8px 15px'
+    }
+  });
+
+  var legendTitle = ui.Label({
+    value: 'Legenda – Uso do solo (MapBiomas)',
+    style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 4px 0'}
+  });
+  legend.add(legendTitle);
+
+  // linha (cor + texto)
+  var makeRow = function(color, code, name) {
+    var colorBox = ui.Label({
+      style: {
+        backgroundColor: color,
+        padding: '8px',
+        margin: '0'
+      }
+    });
+    var description = ui.Label({
+      value: (code ? (code + ' – ') : '') + name,
+      style: {margin: '0 0 4px 6px'}
+    });
+    return ui.Panel({
+      widgets: [colorBox, description],
+      layout: ui.Panel.Layout.Flow('horizontal')
+    });
+  };
+
+  // adiciona as linhas
+  for (var i = 0; i < names.length; i++) {
+    legend.add(makeRow(palette[i], codes ? codes[i] : null, names[i]));
+  }
+
+  Map.add(legend);
+}
+
+// 2) Códigos presentes + nomes (ajuste 39/41 se necessário)
+var classCodes = ['0','3','4','6','11','12','15','24','25','29','30','31','33','39','41'];
+var classNames = [
+  'NI',
+  'Formação Florestal',
+  'Formação Savânica',
+  'Formação Campestre',
+  'Área Não Vegetada',
+  'Praia e Duna',
+  'Pastagem',
+  'Café',
+  'Citrus',
+  'Silvicultura',
+  'Mineração',
+  'Infraestrutura Urbana',
+  'Corpo d’água',
+  'Outros',   // ajuste conforme sua legenda C10
+  'Outros'    // ajuste conforme sua legenda C10
+];
+
+// 3) Pegar paleta MapBiomas (com fallback)
+var palettes = require('users/mapbiomas/modules:Palettes.js');
+var basePalette =
+  palettes.get('classification10') ||
+  palettes.get('classification9')  ||
+  palettes.get('classification');   // fallback final
+
+if (!basePalette) basePalette = []; // segurança
+
+// 4) Montar paleta apenas para os códigos usados (fallback '#999999')
+var paletteSelected = classCodes.map(function(c) {
+  var idx = parseInt(c, 10);
+  return basePalette[idx] || '#999999';
+});
+
+// 5) Adicionar legenda no mapa
+addLegend(paletteSelected, classNames, classCodes, 'bottom-left');
+
+
+// -------------------------------------------------------
+// 8. ÁREA POR CLASSE (apenas classes que ocorreram)
+//    + Tabela no console (FeatureCollection)
+//    + Print formatado em texto (linhas)
+//    Ajustado para os códigos: 0,3,4,6,11,12,15,24,25,29,30,31,33,39,41
+// -------------------------------------------------------
+
+// (8.1) Frequência de códigos presentes
+var freq = clipped.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: geom,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+// Histograma com fallback para dicionário vazio
+var hist = ee.Dictionary(freq.get('classification_2023', ee.Dictionary({})));
+
+// (8.2) Área total (km²) considerando somente pixels válidos do 'clipped'
+var areaDict = ee.Image.pixelArea().divide(1e6)
+  .updateMask(clipped.mask())
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom,
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+var areaTotalKm2 = ee.Number(ee.Dictionary(areaDict).get('area', 0));
+
+// (8.3) LUT — preencha 39 e 41 com o nome oficial da C10 que você utiliza
+var LUT_C10 = ee.Dictionary({
+  '0' :  'Não observado',
+  '3' :  'Formação Florestal',
+  '4' :  'Formação Savânica',
+  '6' :  'Formação Campestre',
+  '11':  'Área Não Vegetada',
+  '12':  'Praia e Duna',
+  '15':  'Pastagem',
+  '24':  'Café',
+  '25':  'Citrus',
+  '29':  'Silvicultura',
+  '30':  'Mineração',
+  '31':  'Infraestrutura Urbana',
+  '33':  'Corpo d’água',
+  '39':  'Outros',   // <<< ajuste o nome aqui
+  '41':  'Outros'    // <<< ajuste o nome aqui
+});
+
+// (8.4) Converte histograma em FeatureCollection com área por código
+var keys = hist.keys().sort();
+var fcAreas = ee.FeatureCollection(
+  keys.map(function(k) {
+    k = ee.String(k);
+    var pixCount = ee.Number(hist.get(k));
+    var areaKm2 = pixCount.multiply(30 * 30).divide(1e6); // 30m*30m = 900 m²
+
+    var name = ee.Algorithms.If(
+      LUT_C10.contains(k),
+      LUT_C10.get(k),
+      'Desconhecida'
+    );
+
+    // % relativo à área total válida do recorte
+    var perc = ee.Algorithms.If(
+      areaTotalKm2.gt(0),
+      ee.Number(areaKm2).divide(areaTotalKm2).multiply(100),
+      0
+    );
+
+    return ee.Feature(null, {
+      code: k,
+      class_name: name,
+      area_km2: areaKm2,
+      perc_area: perc
+    });
+  })
+).sort('area_km2', false);
+
+// (8.5) Tabela “clicável” no console
+print('ÁREA POR CLASSE (ocorrentes) — Tabela', fcAreas);
+
+
+// (8.6) Tabela estilizada em UI (colunas fixas)
+function printTableFC(title, fc, columns, widths, aligns) {
+  var panel = ui.Panel({style: {padding: '8px'}});
+  panel.add(ui.Label(title, {fontWeight: 'bold', margin: '0 0 6px 0'}));
+
+  // Cabeçalho
+  var headerRow = ui.Panel({layout: ui.Panel.Layout.flow('horizontal')});
+  ['Código','Classe','Área (km²)','% do total'].forEach(function(h, i){
+    headerRow.add(ui.Label(h, {
+      fontWeight: 'bold',
+      fontFamily: 'monospace',
+      textAlign: 'left',
+      width: widths[i] + 'px',
+      margin: '0 8px 2px 0'
+    }));
+  });
+  panel.add(headerRow);
+
+  // Trazer dados p/ cliente e montar linhas
+  fc.limit(5000).evaluate(function(fcClient){
+    (fcClient.features || []).forEach(function(feat){
+      var props = feat.properties;
+      var row = ui.Panel({layout: ui.Panel.Layout.flow('horizontal')});
+      var vals = [
+        String(props.code),
+        String(props.class_name),
+        (props.area_km2 || 0).toFixed(2),
+        (props.perc_area || 0).toFixed(2)
+      ];
+      vals.forEach(function(v, i){
+        row.add(ui.Label(v, {
+          fontFamily: 'monospace',
+          textAlign: aligns[i],
+          width: widths[i] + 'px',
+          margin: '0 8px 0 0'
+        }));
+      });
+      panel.add(row);
+    });
+    print(panel);
+  });
+}
+
+// usa: [larguras em px], [alinhamentos: 'left'/'right']
+printTableFC(
+  'ÁREA POR CLASSE (ocorrentes)',
+  fcAreas,
+  ['code','class_name','area_km2','perc_area'],
+  [60, 280, 110, 90],
+  ['left','left','right','right']
+);
