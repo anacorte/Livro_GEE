@@ -1,0 +1,520 @@
+// ===========================
+// :: Área de estudo
+// ===========================
+
+var roi = ee.Geometry.Polygon([
+  [
+    [-49.03657468301609,-22.88712894495612],  // SW
+    [-48.83195432168797,-22.88712894495612],  // SE
+    [-48.83195432168797,-22.66997830885988],  // NE
+    [-49.03657468301609,-22.66997830885988],  // NW
+    [-49.03657468301609,-22.88712894495612]   // fechar polígono
+  ]
+]);
+
+// Período de avaliação
+var start = '2022-01-01'
+var end = '2023-01-01'
+// ===========================
+// :: Máscara MapBiomas 2022 (Floresta plantada)
+// ===========================
+var mapbiomas2022 = ee.Image('projects/mapbiomas-public/assets/brazil/lulc/collection9/mapbiomas_collection90_integration_v1')
+  .select('classification_2022');
+var selectedCodes = [9];
+var forestMask = mapbiomas2022.remap(selectedCodes, selectedCodes).selfMask().clip(roi);
+
+
+// Convertendo geometry em FeatureCollection
+var roiFeatureCollection = ee.FeatureCollection([ee.Feature(roi)]);
+
+// Adicionando limites da área de estudo
+var roiContour = roiFeatureCollection.style({
+  color: 'red',      // border color
+  fillColor: '00000000', // fully transparent
+  width: 2             // border width
+});
+
+// Centralizar mapa e adicionar área de estudo
+Map.centerObject(roi, 11);
+Map.addLayer(roiContour, {}, 'ROI Border');
+
+// ===========================
+// :: Acessando dados GEDI L2A RH98 (altura do percentil 98 - dossel) 25m
+// ===========================
+
+// Funções de filtros de qualidade
+function l2a_quality_mask(image) {
+  var filter1 = image.updateMask(image.select('quality_flag').eq(1));
+  var filter2 = filter1.updateMask(filter1.select('degrade_flag').eq(0));
+  return filter2;
+}
+function fullPower(image) {
+  return image.updateMask(image.select('beam').gte(4));
+}
+
+function night(image) {
+  return image.updateMask(image.select('solar_elevation').lte(0));
+}
+
+var gediL2A = ee.ImageCollection("LARSE/GEDI/GEDI02_A_002_MONTHLY")
+  .filterBounds(roi)
+  .filterDate(start, end)
+  .map(l2a_quality_mask)
+  .map(fullPower)
+  .map(night)
+  .map(function(img){ return img.updateMask(forestMask) })
+  .select(['rh98'])
+  .mosaic();
+
+var gedi_points = gediL2A.sample({
+  region: roi,
+  scale: 25,
+  projection: 'EPSG:4326',
+  geometries: true
+}).filter(ee.Filter.notNull(['rh98']));
+
+
+Map.addLayer(gedi_points, {color: 'grey'}, 'GEDI L2A RH98');
+
+
+// =====================================================
+// :: Dados Óptico (Landsat 9) + Radar (Sentinel-1)
+// :: Inclui índices, métricas texturais e focal mean 
+// =====================================================
+
+// -----------------------------
+// FUNÇÕES AUXILIARES
+// -----------------------------
+
+// Máscara de nuvens e sombras para Landsat 9
+function maskL8sr(image) {
+  var cloudShadowBitMask = 1 << 3;
+  var cloudsBitMask = 1 << 4;
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+              .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask)
+    .select("SR_B[0-9]*")
+    .copyProperties(image, ["system:time_start"]);
+}
+
+// Aplica fatores de escala Landsat 9
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  return image.addBands(opticalBands, null, true);
+}
+
+// -----------------------------
+// DADOS ÓPTICOS 30m (Landsat 9 SR)
+// -----------------------------
+var collectionl9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+  .filterDate(start, end)
+  .filterBounds(roi)
+  .map(maskL8sr)
+  .map(applyScaleFactors)
+  .map(function(img){ return img.updateMask(forestMask) })
+  .filter(ee.Filter.lte('CLOUD_COVER', 10));
+
+// Composição mediana
+var comp = collectionl9.median();
+
+// Índices espectrais (NDVI, EVI e SAVI)
+var ndvi = comp.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+var evi = comp.expression(
+  '2.5 * (NIR - RED) / (NIR + 6*RED - 7.5*BLUE + 1)',
+  {NIR: comp.select('SR_B5'), RED: comp.select('SR_B4'), BLUE: comp.select('SR_B2')}
+).rename('EVI');
+var savi = comp.expression(
+  '((NIR - RED) / (NIR + RED + 0.5)) * 1.5',
+  {NIR: comp.select('SR_B5'), RED: comp.select('SR_B4')}
+).rename('SAVI');
+
+// Composição final óptica
+var composite = ee.Image.cat(comp, ndvi, evi, savi).clip(roi);
+
+// Imprimindo composição RGB e NDVI
+Map.addLayer(composite, {bands: ['SR_B4','SR_B3','SR_B2'], min: 0, max: 0.15}, 'Óptico RGB');
+Map.addLayer(ndvi, {min:-0.2, max:1, palette: ['red', 'white', 'green']}, "NDVI")
+
+// -----------------------------
+// DADOS SAR (Sentinel-1 GRD)
+// -----------------------------
+var collectionVV = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .filterBounds(roi)
+  .map(function(img){ return img.updateMask(forestMask) })
+  .select('VV');
+
+var collectionVH = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .filterBounds(roi)
+  .map(function(img){ return img.updateMask(forestMask) })
+  .select('VH');
+
+// Intervalo temporal e mediana
+var SARVV = collectionVV.filterDate(start, end).median().clip(roi);
+var SARVH = collectionVH.filterDate(start, end).median().clip(roi);
+
+// -----------------------------
+// MÉTRICAS DERIVADAS RADAR
+// -----------------------------
+// Índices RVI, COPOL, COPOL2 e COPOL3
+var RVI = SARVV.expression(
+  'sqrt( (VV) / ((VV + VH) * (VV/VH)) )',
+  {VV: SARVV, VH: SARVH}
+).rename('RVI');
+var COPOL = SARVV.expression('(VV/VH)', {VV: SARVV, VH: SARVH}).rename('COPOL');
+var COPOL2 = SARVV.expression('(VV - VH) - (VV + VH)', {VV: SARVV, VH: SARVH}).rename('COPOL2');
+var COPOL3 = SARVV.expression('(VH/VV)', {VV: SARVV, VH: SARVH}).rename('COPOL3');
+// Coleção de dados de RADAR
+var SAR_all = ee.Image.cat(SARVV.rename('VV'), SARVH.rename('VH'), RVI, COPOL, COPOL2, COPOL3);
+
+// Imprimindo composição VV e VH
+Map.addLayer(SARVV, {min:-15,max:0}, 'VV', 0);
+Map.addLayer(SARVH, {min:-25,max:0}, 'VH', 0);
+
+// -----------------------------
+// TEXTURA E MÉTRICAS FOCAIS
+// -----------------------------
+// Bandas e índices ópticos utilizados
+var optical_bands = ['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7','NDVI','EVI','SAVI'];
+// Textura dados ópticos
+var optical_texture = composite.select(optical_bands)
+  .multiply(10000).toInt32().glcmTexture({average: true});
+// Métricas focais dados ópticos 
+var optical_focal = ee.Image.cat(
+  composite.select(optical_bands).reduceNeighborhood(ee.Reducer.max(), ee.Kernel.square(1)),
+  composite.select(optical_bands).reduceNeighborhood(ee.Reducer.min(), ee.Kernel.square(1)),
+  composite.select(optical_bands).reduceNeighborhood(ee.Reducer.mean(), ee.Kernel.square(1)),
+  composite.select(optical_bands).reduceNeighborhood(ee.Reducer.stdDev(), ee.Kernel.square(1))
+);
+
+// Bandas e índices RADAR utilizados
+var sar_bands = ['VV','VH','RVI','COPOL','COPOL2','COPOL3'];
+// Textura dados RADAR
+var SAR_texture = SAR_all.select(sar_bands)
+  .multiply(10000).toInt32().glcmTexture({average: true});
+// Métricas focais dados RADAR
+var SAR_focal = ee.Image.cat(
+  SAR_all.select(sar_bands).reduceNeighborhood(ee.Reducer.max(), ee.Kernel.square(1)),
+  SAR_all.select(sar_bands).reduceNeighborhood(ee.Reducer.min(), ee.Kernel.square(1)),
+  SAR_all.select(sar_bands).reduceNeighborhood(ee.Reducer.mean(), ee.Kernel.square(1)),
+  SAR_all.select(sar_bands).reduceNeighborhood(ee.Reducer.stdDev(), ee.Kernel.square(1))
+);
+
+// -----------------------------
+// STACK FINAL DE PREDITORES
+// -----------------------------
+var predictors_optSAR = ee.Image.cat([
+  composite,
+  SAR_all,
+  optical_texture,
+  optical_focal,
+  SAR_texture,
+  SAR_focal
+]).clip(roi);
+
+print('Stack de todos preditores em uso (Óptico + SAR):', predictors_optSAR);
+
+// ===========================
+// :: Google Embedding Dataset
+// ===========================
+// Acessando coleção
+var embeddings_col = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL');
+
+// Selecionando dados para o período
+var embeddings = embeddings_col
+      .filterDate('2022-01-01', '2023-01-01')
+      .filterBounds(roi)
+      .map(function(img){ return img.updateMask(forestMask) })
+      .first();
+
+// ========================================
+// :: Preparação do dataset de modelagem
+// ========================================
+var predictors_optSAR = ee.Image.cat([composite, SAR_all, optical_texture, optical_focal, SAR_texture, SAR_focal]);
+var predictors_embeddings = embeddings;
+
+// Amostras: unir GEDI com preditores
+// Criando buffer de 25m  para cada ponto GEDI
+var gedi_buffer = gedi_points.map(function(f) {
+  return f.buffer(25);
+});
+print("n GEDI footprints: ",gedi_buffer.size())
+// Amostrar preditores para cada ponto GEDI
+// COmbinando todos os preditores em um único stack
+var predictors_all = predictors_optSAR.addBands(predictors_embeddings);
+
+// Extraindo dados preditores para pontos GEDI
+var samples_all = predictors_all.reduceRegions({
+  collection: gedi_buffer, // pontos com buffer de 25m
+  reducer: ee.Reducer.median(), // Um valor por polígono (ponto)
+  scale: 30 // tamanho do pixel da imagem
+});
+
+var bands_all = predictors_all.bandNames().getInfo();
+var samples_all = samples_all.filter(
+  ee.Filter.notNull(bands_all)  // filtrando dados com valores nulos
+);
+
+// Amostrando aleatoriamente 200 observações da base de dados
+var samples_all = samples_all.randomColumn('rand')
+  .sort('rand')
+  .limit(200);
+  
+// ===========================
+// :: Divisão da base de dados em treino/teste (70/30)
+// ===========================
+print("Total de Observações selecionadas:", samples_all.size());
+// Divisão aleatória em treino e teste
+samples_all = samples_all.randomColumn('random',123);
+var train_all = samples_all.filter(ee.Filter.lt('random', 0.7));
+var test_all  = samples_all.filter(ee.Filter.gte('random', 0.7));
+print("Observações de treino: ", train_all.size())
+print("Observações de teste: ", test_all.size())
+
+
+// :: Modelagem (Random Forest)
+// ===========================
+var bands_OptSAR = predictors_optSAR.bandNames().getInfo();
+var bands_embed = predictors_embeddings.bandNames().getInfo();
+
+var rf_optSAR = ee.Classifier.smileRandomForest({numberOfTrees: 50,bagFraction: 0.5}).setOutputMode('REGRESSION')
+  .train({features: train_all, classProperty: 'rh98', inputProperties: bands_OptSAR});
+var rf_embed = ee.Classifier.smileRandomForest({numberOfTrees: 50,bagFraction: 0.5}).setOutputMode('REGRESSION')
+  .train({features: train_all, classProperty: 'rh98', inputProperties: bands_embed});
+
+// Aplicando modelos para toda área de estudo
+var map_optSAR = predictors_optSAR.classify(rf_optSAR).clip(roi);
+var map_embed  = predictors_embeddings.classify(rf_embed).clip(roi);
+Map.addLayer(map_optSAR, {min:0, max:35, palette:['#440154', '#31688e', '#fde725']}, 'RH98 Pred (OptSAR)');
+Map.addLayer(map_embed, {min:0, max:35, palette:['#440154', '#31688e', '#fde725']}, 'RH98 Pred (Embedding)');
+
+// Localização das Amostras
+Map.addLayer(train_all, {color: 'blue'}, 'Amostras de treino');
+Map.addLayer(test_all, {color: 'red'}, 'Amostras de teste');
+
+// Predições na base de teste
+var pred_optSAR = test_all.classify(rf_optSAR, 'pred');
+var pred_embed  = test_all.classify(rf_embed, 'pred');
+
+// ==================================================================
+// :: Funções para métricas estatísticas de avaliação do modelos
+// ==================================================================
+
+// RMSE (valor absoluto, mesma unidade que os dados)
+function computeRMSE(fc, obs, pred) {
+  var mse = fc.map(function(f) {
+    var diff = ee.Number(f.get(obs)).subtract(ee.Number(f.get(pred)));
+    return f.set('sq_err', diff.pow(2));
+  }).aggregate_mean('sq_err');
+  return ee.Number(mse).sqrt();
+}
+
+// RMSE relativo (%)
+function computeRRMSE(fc, obs, pred) {
+  var rmse = computeRMSE(fc, obs, pred);
+  var meanObs = ee.Number(fc.aggregate_mean(obs));
+  return rmse.divide(meanObs).multiply(100);  // em %
+}
+
+
+// R² (coeficiente de determinação)
+function computeR2(fc, obs, pred) {
+  var obsMean = ee.Number(fc.aggregate_mean(obs));
+
+  var ssTot = fc.map(function(f) {
+    return f.set('sstot', ee.Number(f.get(obs)).subtract(obsMean).pow(2));
+  }).aggregate_sum('sstot');
+
+  var ssRes = fc.map(function(f) {
+    return f.set('ssres', ee.Number(f.get(obs)).subtract(ee.Number(f.get(pred))).pow(2));
+  }).aggregate_sum('ssres');
+
+  return ee.Number(1).subtract(ee.Number(ssRes).divide(ee.Number(ssTot)));
+}
+
+// ======================================
+// :: Avaliação do modelo Óptico+RADAR
+// ======================================
+
+// Gráfico Observado X Predito
+var eval_optSAR = pred_optSAR.map(function(f){
+  return f.set('obs', f.get('rh98')).set('pred', f.get('pred'));
+});
+
+var eval_optSAR_line = eval_optSAR.map(function(f) {
+  return f.set('one2one', f.get('obs'));
+});
+
+var chart_optSAR = ui.Chart.feature.byFeature(eval_optSAR_line, 'obs', ['pred', 'one2one'])
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'Observado vs Predito (OptSAR)',
+    hAxis: {title: 'Observado RH98', viewWindow: {min: 0, max: 35}},
+    vAxis: {title: 'Predito RH98', viewWindow: {min: 0, max: 35}},
+    pointSize: 0,
+    legend: {position: 'bottom'},
+    series: {
+      0: {color: 'black', pointSize: 3},   // pontos
+      1: {color: 'black', lineWidth: 1}    // linha 1:1
+    },
+    trendlines: {
+      0: {color: 'red', showR2: true, visibleInLegend: true} // linha da regressão
+    }
+  });
+print(chart_optSAR);
+
+// ===========================
+// :: Avaliação do modelo Embedding
+// ===========================
+
+// Gráfico Observado X Predito
+var eval_embed = pred_embed.map(function(f){
+  return f.set('obs', f.get('rh98')).set('pred', f.get('pred'));
+});
+
+var eval_embed_line = eval_embed.map(function(f) {
+  return f.set('one2one', f.get('obs'));
+});
+
+var chart_embed = ui.Chart.feature.byFeature(eval_embed_line, 'obs', ['pred', 'one2one'])
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'Observado vs Predito (Embedding)',
+    hAxis: {title: 'Observado RH98', viewWindow: {min: 0, max: 35}},
+    vAxis: {title: 'Predito RH98', viewWindow: {min: 0, max: 35}},
+    pointSize: 0,
+    legend: {position: 'bottom'},
+    series: {
+      0: {color: 'black', pointSize: 3},   // pontos
+      1: {color: 'black', lineWidth: 1}    // linhas 1:1
+    },
+    trendlines: {
+      0: {color: 'red', showR2: true, visibleInLegend: true} // linha da regressão
+    }
+  });
+print(chart_embed);
+
+// Coletando métricas estatísticas de avaliação dos modelos
+var evalMetrics = ee.FeatureCollection([
+  ee.Feature(null, {
+    'Modelo': 'OptSAR',
+    'RMSE_m': r2(computeRMSE(eval_optSAR, 'obs', 'pred')),
+    'rRMSE_%': r2(computeRRMSE(eval_optSAR, 'obs', 'pred')),
+    'R2': r2(computeR2(eval_optSAR, 'obs', 'pred'))
+  }),
+  ee.Feature(null, {
+    'Modelo': 'Embedding',
+    'RMSE_m': r2(computeRMSE(eval_embed, 'obs', 'pred')),
+    'rRMSE_%': r2(computeRRMSE(eval_embed, 'obs', 'pred')),
+    'R2': r2(computeR2(eval_embed, 'obs', 'pred'))
+  })
+]);
+
+// Imprimir tabela de avaliação
+print('=== Desempenho dos modelos ===');
+var chartEvalMetrics = ui.Chart.feature.byFeature(
+  evalMetrics, 'Modelo',
+  ['RMSE_m','rRMSE_%','R2']
+).setChartType('Table')
+ .setOptions({title: 'Resumo de Avaliação de Modelos'});
+print(chartEvalMetrics);
+
+
+// Estatísticas descritivas dos conjuntos de treinamento e teste
+var statsTrain = train_all.aggregate_stats('rh98');
+var statsTest = test_all.aggregate_stats('rh98');
+
+// Estatísticas descritivas das predições
+var statsOptSAR = map_optSAR.reduceRegion({
+  reducer: ee.Reducer.minMax()
+            .combine(ee.Reducer.mean(), '', true)
+            .combine(ee.Reducer.stdDev(), '', true),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+var statsEmbed = map_embed.reduceRegion({
+  reducer: ee.Reducer.minMax()
+            .combine(ee.Reducer.mean(), '', true)
+            .combine(ee.Reducer.stdDev(), '', true),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+// Função para arredondar
+function r2(x) { return ee.Number(x).multiply(100).round().divide(100); }
+
+// Montando tabela
+var tabelaStats = ee.FeatureCollection([
+  ee.Feature(null, {
+    'Conjunto': 'Treinamento',
+    'RH98_mín': r2(statsTrain.get('min')),
+    'RH98_máx': r2(statsTrain.get('max')),
+    'RH98_média': r2(statsTrain.get('mean')),
+    'RH98_desvio': r2(statsTrain.get('sample_sd'))
+  }),
+  ee.Feature(null, {
+    'Conjunto': 'Teste',
+    'RH98_mín': r2(statsTest.get('min')),
+    'RH98_máx': r2(statsTest.get('max')),
+    'RH98_média': r2(statsTest.get('mean')),
+    'RH98_desvio': r2(statsTest.get('sample_sd'))
+  }),
+  ee.Feature(null, {
+    'Conjunto': 'Predição OptSAR',
+    'RH98_mín': r2(statsOptSAR.get('classification_min')),
+    'RH98_máx': r2(statsOptSAR.get('classification_max')),
+    'RH98_média': r2(statsOptSAR.get('classification_mean')),
+    'RH98_desvio': r2(statsOptSAR.get('classification_stdDev'))
+  }),
+  ee.Feature(null, {
+    'Conjunto': 'Predição Embedding',
+    'RH98_mín': r2(statsEmbed.get('classification_min')),
+    'RH98_máx': r2(statsEmbed.get('classification_max')),
+    'RH98_média': r2(statsEmbed.get('classification_mean')),
+    'RH98_desvio': r2(statsEmbed.get('classification_stdDev'))
+  })
+]);
+
+// Imprimir tabela no console
+print('=== Estatísticas RH98 ===');
+
+// Exibir como tabela no console
+var chartTabelaStats = ui.Chart.feature.byFeature(
+  tabelaStats, 'Conjunto',
+  ['RH98_mín','RH98_máx','RH98_média','RH98_desvio']
+).setChartType('Table')
+ .setOptions({title: 'Resumo Estatístico: RH98'});
+print(chartTabelaStats);
+
+
+
+// ======================================
+// :: Exportar tabelas de teste em CSV
+// ======================================
+
+// Exporta avaliação do modelo Óptico+RADAR
+Export.table.toDrive({
+  collection: eval_optSAR,
+  description: 'Eval_OptSAR',
+  folder: 'GEE_Export',
+  fileNamePrefix: 'tabela_eval_OptSAR',
+  fileFormat: 'CSV'
+});
+
+// Exporta avaliação do modelo Embedding
+Export.table.toDrive({
+  collection: eval_embed,
+  description: 'Eval_Embedding',
+  folder: 'GEE_Export',
+  fileNamePrefix: 'tabela_eval_Embedding',
+  fileFormat: 'CSV'
+});
