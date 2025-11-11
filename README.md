@@ -79,7 +79,7 @@ Pedimos a gentileza de **não compartilhar o arquivo diretamente**. Caso alguém
       <td align="center" style="padding:20px">
         <img src="imagens/fabiano.jpg" alt="Fabiano Rodrigues Pereira" width="180"><br>
         <strong>Fabiano Rodrigues Pereira</strong><br>
-        <a href="mailto:fabianoengflo@gmail.com">fabianoengflo@gmail.com</a>
+        <a href="mailto:fabianoengflo@gmail.com">fabiano.engflo@gmail.com</a>
       </td>
       <td align="center" style="padding:20px">
         <img src="imagens/thais.jpg" alt="Thaís Chaves Almeida" width="180"><br>
