@@ -104,7 +104,7 @@ Acesse outros livros do grupo ForestEyes: 👉 [https://gpforesteyes.github.io/b
 ---
 
 <p align="center">
-  <img src="imagens/foresteyes.jpg" alt="Logo ForestEyes" width="160">
+  <img src="imagens/ForestEyes.png" alt="Logo ForestEyes" width="160">
 </p>
 
 <p align="center"><em>Obrigado por apoiar a ciência aberta e a educação florestal! 🌳</em></p>
