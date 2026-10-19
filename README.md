@@ -1,7 +1,7 @@
 # SENSORIAMENTO REMOTO COM O GOOGLE EARTH ENGINE (GEE): UM ENFOQUE PARA A ENGENHARIA FLORESTAL
 
 <p align="center">
-  <img src="imagens/capa.jpg" alt="Capa do Livro" width="720">
+  <img src="imagens/capa.jpg" alt="Capa do Livro" width="360">  https://gpforesteyes.github.io/
 </p>
 
 <p align="center">
